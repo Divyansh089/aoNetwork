@@ -21,6 +21,14 @@ thiserror = "2"
 
 [dev-dependencies]
 proptest = { version = "1.8", default-features = false, features = ["std"] }
+# Hot-path benches (README, Development). Criterion is the standard
+# measurement harness; dev-dependency only, never part of the library.
+criterion = "0.7.0"
+
+# Hot-path benches (README, Development).
+[[bench]]
+name = "codec"
+harness = false
 
 [features]
 default = ["sim"]

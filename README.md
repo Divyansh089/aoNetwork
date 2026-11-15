@@ -159,15 +159,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo deny check
 cargo doc --no-deps --all-features
+cargo bench                             # criterion benches in benches/
 
 # 3 simulated nodes exchanging data (after NET-12)
 cargo run --example sim_chat
 
-# Fuzzing (after NET-07; nightly toolchain)
-cargo +nightly fuzz run frame_decode
+# Fuzzing (nightly toolchain; frame_decode arrives with NET-07)
+cargo +nightly fuzz run beacon_decode
 ```
 
-CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A seeded simulator suite (< 2 min) and a longer nightly run arrive with NET-09.
+Tests are `cargo test` only: Miri runs in CI, and callgrind is opt-in profiling.
+
+CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A scheduled fuzzer runs every Sunday 00:00 IST for up to 60 minutes, and callgrind profiling runs on manual dispatch (`.github/workflows/`). A seeded simulator suite (< 2 min) and a longer nightly run arrive with NET-09.
 
 ### Using sibling crates locally
 
