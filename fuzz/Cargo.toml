@@ -22,3 +22,17 @@ path = "fuzz_targets/beacon_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembler_push"
+path = "fuzz_targets/reassembler_push.rs"
+test = false
+doc = false
+bench = false

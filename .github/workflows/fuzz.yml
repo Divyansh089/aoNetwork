@@ -23,12 +23,17 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: run every target for its share of the hour
         run: |
+          # 15 of the 60 minutes cover installing cargo-fuzz and building
+          # each target; the other 45 are split evenly. Keep each share at
+          # 10 minutes or more when adding targets.
           n=$(ls fuzz/fuzz_targets/*.rs | wc -l)
-          per=$(( (60 * 60 - 300) / n ))
+          per=$(( (60 * 60 - 15 * 60) / n ))
           for t in fuzz/fuzz_targets/*.rs; do
             name=$(basename "$t" .rs)
             echo "== $name (${per}s)"
-            cargo fuzz run "$name" -- -max_total_time=$per
+            # New inputs go to fuzz/corpus; the checked-in seeds stay read-only.
+            mkdir -p "fuzz/corpus/$name"
+            cargo fuzz run "$name" "fuzz/corpus/$name" "fuzz/seeds/$name" -- -max_total_time=$per
           done
       - name: upload crashes and corpus
         if: failure()
