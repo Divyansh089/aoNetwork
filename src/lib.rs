@@ -56,9 +56,11 @@ mod error;
 mod types;
 
 pub use codec::{
-    AppHello, BEACON_LEN, BEACON_VERSION, Beacon, BeaconFlags, FRAME_VERSION, Frame, Hello,
-    MAX_APP_HELLO,
+    AppHello, BEACON_LEN, BEACON_VERSION, Beacon, BeaconFlags, FRAME_VERSION, Fragmenter, Frame,
+    Hello, MAX_APP_HELLO, MAX_MTU, MIN_MTU, Reassembler,
 };
 pub use config::NetworkConfig;
-pub use error::{BeaconError, ConfigError, DisconnectReason, FrameError, NetError, SendError};
+pub use error::{
+    BeaconError, ConfigError, DisconnectReason, FragmentError, FrameError, NetError, SendError,
+};
 pub use types::{Channel, LinkId, LinkRole, LocalTag, PeerKey};

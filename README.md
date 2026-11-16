@@ -2,7 +2,7 @@
 
 **The link layer of the aoheyra mesh.** A sans-IO Rust crate that turns a raw Bluetooth LE radio (or an in-memory simulator) into reliable, prioritised, abuse-resistant links between neighbouring phones.
 
-> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec) and NET-06 (beacon codec) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
+> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler) and NET-06 (beacon codec) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
 
 Cargo package name: `ao_network` (the repo name keeps its capitals; the package is snake_case).
 
@@ -94,7 +94,7 @@ Hand-rolled, big-endian, version and type bytes plus canonical LEB128 lengths. *
 receiver's `max_frame` before allocating. The version-1 layout is recorded in
 [the NET-04 ADR](docs/adr/net-04-frame-wire-format.md).
 
-Fragmentation uses a 1-byte chunk header (START, END, 3-bit sequence). Payload per chunk is `MTU − 3 − 1`. One frame is in flight per link.
+Fragmentation uses a 1-byte chunk header (START, END, 3-bit sequence). Payload per chunk is `MTU − 3 − 1`. One frame is in flight per link. `Fragmenter` and `Reassembler` implement it; the chunk rules are recorded in [the NET-05 ADR](docs/adr/net-05-chunk-format.md).
 
 Beacon (16 bytes, manufacturer data in the scan response): version, flags (accepting / relay-willing / low-battery), degree, max_links, 8-byte hint, 4-byte digest. Encoding and decoding live in Rust only; Kotlin passes raw bytes.
 
@@ -111,6 +111,7 @@ and scanning are separate work.
 | `max_links` | 5 (target stable 3, max stable 4, 1 explore, 1 opportunistic) |
 | `min_rssi` | -90 dBm |
 | Handshake timeout | 5 s |
+| Reassembly timeout | 10 s from the first chunk |
 | Keepalive | ping after 15 s idle, 3 missed pongs close the link |
 | `max_frame` | 16 KiB |
 | Send-queue cap | 128 KiB per link |
