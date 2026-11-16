@@ -2,7 +2,7 @@
 
 **The link layer of the aoheyra mesh.** A sans-IO Rust crate that turns a raw Bluetooth LE radio (or an in-memory simulator) into reliable, prioritised, abuse-resistant links between neighbouring phones.
 
-> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler) and NET-06 (beacon codec) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
+> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec) and NET-07 (fuzz targets) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
 
 Cargo package name: `ao_network` (the repo name keeps its capitals; the package is snake_case).
 
@@ -170,13 +170,13 @@ cargo bench                             # criterion benches in benches/
 # 3 simulated nodes exchanging data (after NET-12)
 cargo run --example sim_chat
 
-# Fuzzing (nightly toolchain; frame_decode arrives with NET-07)
-cargo +nightly fuzz run beacon_decode
+# Fuzzing (nightly toolchain): beacon_decode, frame_decode, reassembler_push
+cargo +nightly fuzz run frame_decode
 ```
 
 Tests are `cargo test` only: Miri runs in CI, and callgrind is opt-in profiling.
 
-CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A scheduled fuzzer runs every Sunday 00:00 IST for up to 60 minutes, and callgrind profiling runs on manual dispatch (`.github/workflows/`). A seeded simulator suite (< 2 min) and a longer nightly run arrive with NET-09.
+CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A scheduled fuzzer runs every target every Sunday 00:00 IST (15 minutes each within a 60-minute job), starting from the corpus checked in under `fuzz/corpus/`, and callgrind profiling runs on manual dispatch (`.github/workflows/`). A seeded simulator suite (< 2 min) and a longer nightly run arrive with NET-09.
 
 ### Using sibling crates locally
 
