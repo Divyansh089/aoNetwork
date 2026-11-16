@@ -274,3 +274,28 @@ pub enum ConnectError {
 
 A clean close by the peer arrives as a `Bye` frame before the radio drops, so
 `DisconnectReason::Bye` never comes from a status code.
+
+## 9. Mapping to `Transport` (Rust)
+
+`NativeTransport` implements the `Transport` trait over this contract.
+
+| `Transport` | `NativeSink` |
+|---|---|
+| `set_advertising(Some(AdvProfile { beacon, mode }))` / `None` | `set_advertising(Some(beacon), mode)` / `None` |
+| `set_scanning(Some(ScanProfile { mode }))` / `None` | `set_scanning(Some(mode))` / `None` |
+| `connect(peer)` | allocates a `LinkId`, then `connect(link, peer)` |
+| `write` / `disconnect` | `write` / `disconnect` |
+
+`PowerMode` maps one-to-one onto `AdvertiseMode` and `ScanMode`.
+
+| `NativeEvents` | `TransportEvent` |
+|---|---|
+| `on_radio_state` | `RadioState` |
+| `on_scan_result` | `Discovered` |
+| `on_connected` | `Connected { role: Initiator }` |
+| `on_accepted` | `Connected { role: Responder }` with a newly allocated `LinkId` |
+| `on_mtu_changed`, `on_bytes`, `on_write_ready` | `MtuChanged`, `Received`, `WriteReady` |
+| `on_closed` before / after the link was up | `ConnectFailed` / `Disconnected`, per §8 (`Requested` gives `Cancelled` / `Closed`) |
+
+`on_discovery_failed` is logged; discovery restarts on the next profile change.
+The native shim reports neither `Lost` nor `Rssi`.

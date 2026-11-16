@@ -220,6 +220,39 @@ pub enum FragmentError {
     Timeout,
 }
 
+/// Why an outbound link never came up.
+///
+/// The mapping from Android status codes is specified in
+/// `docs/native-contract.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConnectError {
+    /// The radio or our own timer gave up waiting.
+    #[error("connect timed out")]
+    Timeout,
+    /// We closed the link before it came up.
+    #[error("connect cancelled")]
+    Cancelled,
+    /// The peer refused or had no room.
+    #[error("connect rejected by peer")]
+    Rejected,
+    /// The peer could not be reached.
+    #[error("peer unreachable")]
+    Unreachable,
+    /// Connected, but service discovery or subscription failed.
+    #[error("link setup failed")]
+    SetupFailed,
+    /// The peer does not offer the aoheyra GATT service.
+    #[error("peer lacks the aoheyra service")]
+    ServiceMissing,
+    /// The radio has no address for the peer (not seen in a scan).
+    #[error("peer unknown to the radio")]
+    PeerUnknown,
+    /// The radio is off or not permitted.
+    #[error("radio unavailable")]
+    RadioUnavailable,
+}
+
 /// Errors from network-level operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
