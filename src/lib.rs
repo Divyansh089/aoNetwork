@@ -53,6 +53,7 @@
 mod codec;
 mod config;
 mod error;
+mod transport;
 mod types;
 
 pub use codec::{
@@ -61,6 +62,10 @@ pub use codec::{
 };
 pub use config::NetworkConfig;
 pub use error::{
-    BeaconError, ConfigError, DisconnectReason, FragmentError, FrameError, NetError, SendError,
+    BeaconError, ConfigError, ConnectError, DisconnectReason, FragmentError, FrameError, NetError,
+    SendError,
+};
+pub use transport::{
+    AdvProfile, PowerMode, RadioState, ScanProfile, Transport, TransportCaps, TransportEvent,
 };
 pub use types::{Channel, LinkId, LinkRole, LocalTag, PeerKey};

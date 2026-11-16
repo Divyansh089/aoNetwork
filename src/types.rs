@@ -6,7 +6,7 @@
 
 /// Stable identifier of a link on *this* node.
 ///
-/// Allocated monotonically by the link manager and never sent on the wire:
+/// Allocated monotonically by the transport and never sent on the wire:
 /// each endpoint names the same connection with its own id, so ids are purely
 /// local. A `u64` keeps wrap-around out of reach for any realistic lifetime,
 /// including long fuzzing or simulation runs.
@@ -31,7 +31,7 @@ pub struct LinkId(u64);
 impl LinkId {
     /// Creates a `LinkId` from its raw representation.
     ///
-    /// Production callers get ids from the link manager; `new` exists for
+    /// Production callers get ids from the transport; `new` exists for
     /// tests, sim scripts and log/trace reconstruction.
     pub const fn new(raw: u64) -> Self {
         Self(raw)
