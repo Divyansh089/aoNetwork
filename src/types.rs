@@ -146,6 +146,16 @@ pub enum Channel {
     Bulk,
 }
 
+impl Channel {
+    /// Every channel, in [`index`](Self::index) order.
+    pub(crate) const ALL: [Self; 4] = [Self::Control, Self::Message, Self::Telemetry, Self::Bulk];
+
+    /// Position in per-channel arrays.
+    pub(crate) fn index(self) -> usize {
+        self as usize
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
