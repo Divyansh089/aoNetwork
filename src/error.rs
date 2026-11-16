@@ -104,6 +104,69 @@ pub enum BeaconError {
     },
 }
 
+/// A link frame failed structural validation.
+///
+/// Frames come from untrusted neighbours; every variant is a normal outcome
+/// of decoding hostile bytes. Variants carry lengths and header bytes only,
+/// never payload contents.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FrameError {
+    /// The input is longer than the receiver's `max_frame`.
+    #[error("frame of {len} bytes exceeds max_frame {max}")]
+    Oversize {
+        /// Received length.
+        len: usize,
+        /// The receiver's limit.
+        max: usize,
+    },
+
+    /// The input ends before the frame does.
+    #[error("frame truncated")]
+    Truncated,
+
+    /// The sender uses a frame version this codec does not understand.
+    #[error("unsupported frame version: {version}")]
+    UnsupportedVersion {
+        /// Received version byte.
+        version: u8,
+    },
+
+    /// The type byte names no known frame.
+    #[error("unknown frame type: {frame_type:#04x}")]
+    UnknownType {
+        /// Received type byte.
+        frame_type: u8,
+    },
+
+    /// A `Data` frame names no known channel.
+    #[error("unknown channel: {channel}")]
+    UnknownChannel {
+        /// Received channel byte.
+        channel: u8,
+    },
+
+    /// A LEB128 length is overlong or overflows 64 bits.
+    #[error("malformed LEB128 length")]
+    InvalidVarint,
+
+    /// An `app_hello` blob is longer than allowed.
+    #[error("app_hello of {len} bytes exceeds {max}")]
+    AppHelloTooLong {
+        /// Received or supplied length.
+        len: usize,
+        /// The allowed maximum.
+        max: usize,
+    },
+
+    /// Bytes remain after a complete frame.
+    #[error("{extra} trailing bytes after frame")]
+    TrailingBytes {
+        /// Number of unread bytes.
+        extra: usize,
+    },
+}
+
 /// Errors from network-level operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -115,6 +178,10 @@ pub enum NetError {
     /// A received discovery beacon is malformed or unsupported.
     #[error("invalid beacon: {0}")]
     InvalidBeacon(#[from] BeaconError),
+
+    /// A received link frame is malformed or unsupported.
+    #[error("invalid frame: {0}")]
+    InvalidFrame(#[from] FrameError),
 }
 
 /// A send could not be queued.
