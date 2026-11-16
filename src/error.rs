@@ -314,8 +314,8 @@ pub enum DisconnectReason {
     Closed,
     /// The peer sent a `Bye` frame.
     Bye,
-    /// The handshake did not complete (timeout or rejection).
-    HandshakeFailed,
+    /// The handshake did not complete.
+    HandshakeFailed(HandshakeFailure),
     /// Keepalive saw `max_missed_pongs` consecutive missed pongs.
     KeepaliveTimeout,
     /// Malformed or unexpected traffic from the peer.
@@ -328,6 +328,18 @@ pub enum DisconnectReason {
     Duplicate,
     /// The underlying transport or radio went away.
     TransportLost,
+}
+
+/// Why a handshake failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HandshakeFailure {
+    /// The two sides share no link protocol version.
+    VersionMismatch,
+    /// The peer's `app_hello` exceeds `MAX_APP_HELLO`.
+    OversizeHello,
+    /// No valid `Hello` arrived within `handshake_timeout`.
+    Timeout,
 }
 
 #[cfg(test)]
@@ -375,7 +387,9 @@ mod tests {
         let reasons = [
             DisconnectReason::Closed,
             DisconnectReason::Bye,
-            DisconnectReason::HandshakeFailed,
+            DisconnectReason::HandshakeFailed(HandshakeFailure::VersionMismatch),
+            DisconnectReason::HandshakeFailed(HandshakeFailure::OversizeHello),
+            DisconnectReason::HandshakeFailed(HandshakeFailure::Timeout),
             DisconnectReason::KeepaliveTimeout,
             DisconnectReason::ProtocolViolation,
             DisconnectReason::AbuseDetected,

@@ -53,6 +53,7 @@
 mod codec;
 mod config;
 mod error;
+mod link;
 #[cfg(feature = "sim")]
 mod sim;
 mod transport;
@@ -64,9 +65,10 @@ pub use codec::{
 };
 pub use config::NetworkConfig;
 pub use error::{
-    BeaconError, ConfigError, ConnectError, DisconnectReason, FragmentError, FrameError, NetError,
-    SendError,
+    BeaconError, ConfigError, ConnectError, DisconnectReason, FragmentError, FrameError,
+    HandshakeFailure, NetError, SendError,
 };
+pub use link::{Link, LinkAction, LinkEnd, LinkState};
 #[cfg(feature = "sim")]
 pub use sim::{NodeId, SIM_RSSI, SimConfig, SimError, SimNode, SimTransport, SimWorld};
 pub use transport::{
