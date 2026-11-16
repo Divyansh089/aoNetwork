@@ -2,7 +2,7 @@
 
 **The link layer of the aoheyra mesh.** A sans-IO Rust crate that turns a raw Bluetooth LE radio (or an in-memory simulator) into reliable, prioritised, abuse-resistant links between neighbouring phones.
 
-> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets) and NET-08 (transport trait) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
+> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait) and NET-09 (simulator) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
 
 Cargo package name: `ao_network` (the repo name keeps its capitals; the package is snake_case).
 
@@ -122,7 +122,7 @@ These may change after the BLE spike (AND-02). Source of truth is `NetworkConfig
 
 | Feature | Default | Meaning |
 |---|---|---|
-| `sim` | yes | In-memory `SimWorld` transport; use it as a `dev-dependency` from aoMesh and aoheyra |
+| `sim` | yes | In-memory `SimWorld` transport; use it as a `dev-dependency` from aoMesh and aoheyra. Seeded and driven by a paused clock (`SimWorld::advance`), so a run reproduces exactly |
 | `native` | no | `NativeTransport` adapter for the Kotlin BLE shim. No UniFFI dependency in this crate |
 
 ## API sketch
