@@ -150,10 +150,10 @@ impl SendError {
 
 /// Why a link came down.
 ///
-/// Handed to the owner of the link (and eventually mapped to Android status
-/// codes in NET-03) so the layer above can decide whether to reconnect,
-/// back off or report. `#[non_exhaustive]`: later issues add reasons as the
-/// state machine, guard and duplicate resolution land.
+/// Handed to the owner of the link so the layer above can decide whether to
+/// reconnect, back off or report. The mapping from Android status codes is
+/// specified in `docs/native-contract.md`. `#[non_exhaustive]`: later issues
+/// add reasons as the state machine, guard and duplicate resolution land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DisconnectReason {
