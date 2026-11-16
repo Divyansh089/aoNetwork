@@ -1,0 +1,266 @@
+//! Link lifecycle over the simulator: the handshake outcome and the exact
+//! reason each link goes down.
+#![cfg(feature = "sim")]
+
+use std::collections::{BTreeMap, VecDeque};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
+use ao_network::{
+    AdvProfile, AppHello, DisconnectReason, Fragmenter, HandshakeFailure, Hello, Link, LinkAction,
+    LinkEnd, LinkId, LinkRole, LocalTag, NetworkConfig, PowerMode, SimConfig, SimNode,
+    SimTransport, SimWorld, Transport, TransportEvent,
+};
+
+const TICK: Duration = Duration::from_millis(10);
+const MTU: u16 = 23;
+
+fn hello(proto_min: u8, proto_max: u8, app_hello: usize) -> Hello {
+    Hello {
+        proto_min,
+        proto_max,
+        caps: 0,
+        max_frame: 16 * 1024,
+        tag: LocalTag::new([proto_max; 16]),
+        app_hello: AppHello::new(vec![0xA5; app_hello]).unwrap(),
+    }
+}
+
+/// A node that runs `Link`s, or a raw one (`hello: None`) that only sends
+/// what the test queues, to play a broken peer.
+struct Node {
+    radio: SimTransport,
+    hello: Option<Hello>,
+    links: BTreeMap<LinkId, Link>,
+    log: Vec<LinkAction>,
+    raw_out: VecDeque<Vec<u8>>,
+    raw_link: Option<LinkId>,
+    raw_can_write: bool,
+}
+
+impl Node {
+    fn new(world: &SimWorld, hello: Option<Hello>) -> Self {
+        let mut radio = world
+            .add_node(SimNode {
+                mtu: MTU,
+                ..SimNode::default()
+            })
+            .unwrap();
+        radio.start();
+        radio.set_advertising(Some(AdvProfile {
+            beacon: [0; 16],
+            mode: PowerMode::Balanced,
+        }));
+        Self {
+            radio,
+            hello,
+            links: BTreeMap::new(),
+            log: Vec::new(),
+            raw_out: VecDeque::new(),
+            raw_link: None,
+            raw_can_write: false,
+        }
+    }
+
+    fn connect(&mut self, peer: &Node) {
+        let link = self.radio.connect(peer.radio.peer_key());
+        let hello = self.hello.clone().expect("only link nodes connect");
+        self.links
+            .insert(link, Link::new(&NetworkConfig::default(), hello));
+    }
+
+    fn apply(&mut self, link: LinkId, actions: Vec<LinkAction>) {
+        for action in actions {
+            match action {
+                LinkAction::Write(chunk) => self.radio.write(link, chunk),
+                LinkAction::Disconnect => self.radio.disconnect(link),
+                other => self.log.push(other),
+            }
+        }
+    }
+
+    fn step(&mut self, now: Duration) {
+        let mut cx = Context::from_waker(Waker::noop());
+        while let Poll::Ready(event) = self.radio.poll_event(&mut cx) {
+            let link = match &event {
+                TransportEvent::Connected { link, .. }
+                | TransportEvent::ConnectFailed { link, .. }
+                | TransportEvent::Received { link, .. }
+                | TransportEvent::WriteReady { link }
+                | TransportEvent::MtuChanged { link, .. }
+                | TransportEvent::Disconnected { link, .. } => *link,
+                _ => continue,
+            };
+            let Some(hello) = self.hello.clone() else {
+                self.raw_event(&event);
+                continue;
+            };
+            if let TransportEvent::Connected {
+                role: LinkRole::Responder,
+                ..
+            } = event
+            {
+                self.links
+                    .insert(link, Link::new(&NetworkConfig::default(), hello));
+            }
+            if let Some(machine) = self.links.get_mut(&link) {
+                let actions = machine.on_event(now, event);
+                self.apply(link, actions);
+            }
+        }
+        let ids: Vec<LinkId> = self.links.keys().copied().collect();
+        for link in ids {
+            let actions = self.links.get_mut(&link).unwrap().on_tick(now);
+            self.apply(link, actions);
+        }
+        self.raw_flush();
+    }
+
+    fn raw_event(&mut self, event: &TransportEvent) {
+        match event {
+            TransportEvent::Connected { link, .. } => {
+                self.raw_link = Some(*link);
+                self.raw_can_write = true;
+            }
+            TransportEvent::WriteReady { .. } => self.raw_can_write = true,
+            _ => {}
+        }
+    }
+
+    fn raw_flush(&mut self) {
+        if let (Some(link), true) = (self.raw_link, self.raw_can_write) {
+            if let Some(chunk) = self.raw_out.pop_front() {
+                self.raw_can_write = false;
+                self.radio.write(link, chunk);
+            }
+        }
+    }
+
+    fn down(&self) -> Option<LinkEnd> {
+        self.log.iter().find_map(|action| match action {
+            LinkAction::Down(end) => Some(*end),
+            _ => None,
+        })
+    }
+}
+
+/// `a` (a link node) connects to `b`; runs for `duration` of simulated time.
+fn run(a: Option<Hello>, b: Option<Hello>, raw_frame: Vec<u8>, duration: Duration) -> (Node, Node) {
+    let world = SimWorld::new(SimConfig::default());
+    let mut a = Node::new(&world, a);
+    let mut b = Node::new(&world, b);
+    world.set_in_range(a.radio.node(), b.radio.node(), true);
+    b.raw_out = Fragmenter::new(&raw_frame, MTU).unwrap().collect();
+    a.connect(&b);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < duration {
+        world.advance(TICK);
+        elapsed += TICK;
+        a.step(world.now());
+        b.step(world.now());
+    }
+    (a, b)
+}
+
+fn down(reason: DisconnectReason) -> Option<LinkEnd> {
+    Some(LinkEnd::Disconnected(reason))
+}
+
+#[test]
+fn hellos_meet_at_the_highest_shared_version() {
+    // A full 256-byte app_hello spans many chunks at the minimum MTU.
+    let (a, b) = run(
+        Some(hello(1, 3, 256)),
+        Some(hello(2, 5, 256)),
+        Vec::new(),
+        Duration::from_secs(2),
+    );
+    for (node, peer) in [(&a, &b), (&b, &a)] {
+        assert_eq!(
+            node.log,
+            [LinkAction::Ready {
+                remote: peer.hello.clone().unwrap(),
+                version: 3
+            }]
+        );
+    }
+}
+
+#[test]
+fn version_mismatch_closes_both_sides() {
+    let (a, b) = run(
+        Some(hello(1, 1, 0)),
+        Some(hello(2, 2, 0)),
+        Vec::new(),
+        Duration::from_secs(2),
+    );
+    let mismatch = down(DisconnectReason::HandshakeFailed(
+        HandshakeFailure::VersionMismatch,
+    ));
+    assert_eq!(a.down(), mismatch);
+    assert_eq!(b.down(), mismatch);
+}
+
+#[test]
+fn oversize_app_hello_closes_the_link() {
+    // A Hello frame claiming a 257-byte app_hello, which no honest encoder
+    // produces: header, proto 1..1, caps, max_frame, tag, LEB128 257.
+    let mut frame = vec![1, 0x01, 1, 1, 0, 0, 0, 0, 0, 0, 0x40, 0];
+    frame.extend_from_slice(&[7; 16]);
+    frame.extend_from_slice(&[0x81, 0x02]);
+    frame.extend_from_slice(&[0; 257]);
+    let (a, _) = run(Some(hello(1, 1, 0)), None, frame, Duration::from_secs(2));
+    assert_eq!(
+        a.down(),
+        down(DisconnectReason::HandshakeFailed(
+            HandshakeFailure::OversizeHello
+        ))
+    );
+}
+
+#[test]
+fn silent_peer_times_out_after_handshake_timeout() {
+    let timeout = NetworkConfig::default().handshake_timeout();
+    // Connect latency is at most 300 ms by default, so the link is up by
+    // then; the deadline falls between these two runs.
+    let (early, _) = run(Some(hello(1, 1, 0)), None, Vec::new(), timeout);
+    assert_eq!(early.down(), None);
+    let (late, _) = run(
+        Some(hello(1, 1, 0)),
+        None,
+        Vec::new(),
+        timeout + Duration::from_millis(400),
+    );
+    assert_eq!(
+        late.down(),
+        down(DisconnectReason::HandshakeFailed(HandshakeFailure::Timeout))
+    );
+}
+
+#[test]
+fn close_says_bye_and_each_side_reports_its_reason() {
+    let world = SimWorld::new(SimConfig::default());
+    let mut a = Node::new(&world, Some(hello(1, 1, 0)));
+    let mut b = Node::new(&world, Some(hello(1, 1, 0)));
+    world.set_in_range(a.radio.node(), b.radio.node(), true);
+    a.connect(&b);
+    for _ in 0..100 {
+        world.advance(TICK);
+        a.step(world.now());
+        b.step(world.now());
+    }
+    let link = *a.links.keys().next().unwrap();
+    let actions = a
+        .links
+        .get_mut(&link)
+        .unwrap()
+        .close(DisconnectReason::DegreeCap);
+    a.apply(link, actions);
+    for _ in 0..100 {
+        world.advance(TICK);
+        a.step(world.now());
+        b.step(world.now());
+    }
+    assert_eq!(a.down(), down(DisconnectReason::DegreeCap));
+    assert_eq!(b.down(), down(DisconnectReason::Bye));
+}
