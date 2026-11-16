@@ -39,6 +39,10 @@ pub enum ConfigError {
     #[error("handshake_timeout must be greater than zero")]
     HandshakeTimeoutZero,
 
+    /// `reassembly_timeout` is zero, so no multi-chunk frame could complete.
+    #[error("reassembly_timeout must be greater than zero")]
+    ReassemblyTimeoutZero,
+
     /// `keepalive_interval` is zero, so keepalive would fire every instant.
     #[error("keepalive_interval must be greater than zero")]
     KeepaliveIntervalZero,
@@ -165,6 +169,55 @@ pub enum FrameError {
         /// Number of unread bytes.
         extra: usize,
     },
+}
+
+/// A chunk could not be produced or reassembled.
+///
+/// Every receive-side variant means the partial frame was dropped; the next
+/// frame must begin with a fresh START chunk.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FragmentError {
+    /// The ATT MTU is outside the range a BLE stack may negotiate.
+    #[error("unsupported ATT MTU: {mtu}")]
+    InvalidMtu {
+        /// The rejected MTU.
+        mtu: u16,
+    },
+
+    /// A chunk carries no payload.
+    #[error("chunk has no payload")]
+    EmptyChunk,
+
+    /// A chunk's sequence number is not the next one expected.
+    #[error("chunk sequence gap: expected {expected}, got {actual}")]
+    SeqGap {
+        /// Expected sequence number.
+        expected: u8,
+        /// Received sequence number.
+        actual: u8,
+    },
+
+    /// A START chunk arrived while another frame was still in flight.
+    #[error("START received while a frame is in flight")]
+    StartWhileBusy,
+
+    /// A continuation chunk arrived with no frame in flight.
+    #[error("continuation received without START")]
+    MissingStart,
+
+    /// The frame would exceed the receiver's `max_frame`.
+    #[error("frame of {len} bytes exceeds max_frame {max}")]
+    TooLarge {
+        /// Bytes the frame would hold with this chunk.
+        len: usize,
+        /// The receiver's limit.
+        max: usize,
+    },
+
+    /// The frame did not complete within `reassembly_timeout`.
+    #[error("frame reassembly timed out")]
+    Timeout,
 }
 
 /// Errors from network-level operations.
