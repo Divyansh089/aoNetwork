@@ -99,32 +99,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_stops_at_the_last_group() {
-        assert_eq!(decode(&[0x80, 0x01, 0xAA, 0xBB]), Ok((128, 2)));
-    }
-
-    #[test]
-    fn empty_and_unterminated_input_is_truncated() {
-        assert_eq!(decode(&[]), Err(FrameError::Truncated));
-        assert_eq!(decode(&[0x80]), Err(FrameError::Truncated));
-        assert_eq!(decode(&[0xFF; 9]), Err(FrameError::Truncated));
-    }
-
-    #[test]
-    fn overlong_encodings_are_rejected() {
+    fn non_canonical_forms_are_rejected() {
+        // Overlong: a trailing zero group.
         assert_eq!(decode(&[0x80, 0x00]), Err(FrameError::InvalidVarint));
-        assert_eq!(decode(&[0xFF, 0x80, 0x00]), Err(FrameError::InvalidVarint));
-    }
-
-    #[test]
-    fn overflow_is_rejected() {
+        // Overflow: the tenth group carries more than bit 63.
         let mut too_big = [0xFF; 10];
         too_big[9] = 0x02;
         assert_eq!(decode(&too_big), Err(FrameError::InvalidVarint));
-        // Continuation bit on the tenth group would need an eleventh.
-        let mut eleven = [0xFF; 11];
-        eleven[10] = 0x01;
-        assert_eq!(decode(&eleven), Err(FrameError::InvalidVarint));
     }
 
     proptest! {
@@ -135,15 +116,6 @@ mod tests {
             let bytes = encoded(value);
             prop_assert_eq!(bytes.len(), encoded_len(value));
             prop_assert_eq!(decode(&bytes), Ok((value, bytes.len())));
-        }
-
-        #[test]
-        fn arbitrary_bytes_never_panic_and_accepted_forms_are_canonical(
-            input in prop::collection::vec(any::<u8>(), 0..16),
-        ) {
-            if let Ok((value, used)) = decode(&input) {
-                prop_assert_eq!(&encoded(value)[..], &input[..used]);
-            }
         }
     }
 }

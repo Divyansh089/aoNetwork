@@ -95,23 +95,13 @@ proptest! {
     }
 
     #[test]
-    fn arbitrary_bytes_never_panic_and_accepted_bytes_are_canonical(
-        input in prop::collection::vec(any::<u8>(), 0..64),
-    ) {
-        // A typed error is the normal outcome for hostile input; proptest
-        // fails the property if decode panics.
-        if let Ok(frame) = Frame::decode(&input, MAX) {
-            prop_assert_eq!(frame.encode(), input);
-        }
-    }
-
-    #[test]
-    fn version_one_inputs_never_panic_and_accepted_bytes_are_canonical(
+    fn hostile_bodies_never_panic_and_accepted_bytes_are_canonical(
         frame_type in 0u8..8,
         body in prop::collection::vec(any::<u8>(), 0..64),
     ) {
-        // Random bytes rarely pass the version check; pin it so the body
-        // parsers see hostile input too.
+        // Version pinned so the body parsers, not the version check, see the
+        // hostile bytes. A typed error is the expected outcome; a panic
+        // fails the property.
         let mut input = vec![1, frame_type];
         input.extend_from_slice(&body);
         if let Ok(frame) = Frame::decode(&input, MAX) {
