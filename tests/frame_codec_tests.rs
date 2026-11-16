@@ -109,16 +109,40 @@ fn unknown_channel_is_rejected() {
 }
 
 #[test]
-fn overlong_length_is_rejected() {
+fn payload_lengths_use_leb128() {
+    for (len, prefix) in [
+        (0, &[0x00][..]),
+        (127, &[0x7F]),
+        (128, &[0x80, 0x01]),
+        (300, &[0xAC, 0x02]),
+    ] {
+        let wire = Frame::Data {
+            channel: Channel::Control,
+            payload: vec![0; len],
+        }
+        .encode();
+        assert_eq!(&wire[3..3 + prefix.len()], prefix, "length {len}");
+    }
+}
+
+#[test]
+fn non_canonical_lengths_are_rejected() {
+    // Overlong: a trailing zero group.
     assert_eq!(
         Frame::decode(&[1, 0x02, 0, 0x80, 0x00], MAX),
         Err(FrameError::InvalidVarint)
     );
+    // Overflow: the tenth group carries more than bit 63.
+    let mut wire = vec![1, 0x02, 0];
+    wire.extend_from_slice(&[0xFF; 9]);
+    wire.push(0x02);
+    assert_eq!(Frame::decode(&wire, MAX), Err(FrameError::InvalidVarint));
 }
 
 #[test]
 fn huge_declared_length_is_truncated_without_allocating() {
-    // Claims u64::MAX payload bytes in a 13-byte input.
+    // Claims u64::MAX payload bytes (the longest valid LEB128) in a 13-byte
+    // input.
     let mut wire = vec![1, 0x02, 0];
     wire.extend_from_slice(&[0xFF; 9]);
     wire.push(0x01);
