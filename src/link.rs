@@ -2,15 +2,16 @@
 //! `Hello` exchange to `Ready`, and down again with a typed reason.
 //!
 //! [`Link`] is sans-IO. The owner routes this link's [`TransportEvent`]s
-//! in, calls [`Link::on_tick`] from its timer, and carries out the returned
-//! [`LinkAction`]s. Time is injected.
+//! in, submits payloads with [`Link::send`], calls [`Link::on_tick`] from
+//! its timer, and carries out the returned [`LinkAction`]s. Time is
+//! injected.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::{
     Channel, ConnectError, DisconnectReason, Fragmenter, Frame, FrameError, HandshakeFailure,
-    Hello, NetworkConfig, Reassembler, TransportEvent,
+    Hello, MAX_MTU, MIN_MTU, NetworkConfig, Reassembler, SendError, SendQueue, TransportEvent,
 };
 
 /// Where a link is in its lifecycle.
@@ -69,7 +70,10 @@ pub enum LinkEnd {
 /// The state machine for one link.
 ///
 /// One outgoing frame is in flight at a time and one chunk of it per
-/// transport write credit. A peer frame other than `Hello` before the
+/// transport write credit. Payloads wait in a [`SendQueue`] and the next
+/// one is taken only when the frame before it is fully written, once the
+/// link is ready. Payloads still queued when the link closes are discarded
+/// with it. A peer frame other than `Hello` before the
 /// handshake, a malformed frame or a broken chunk stream closes the link
 /// with [`DisconnectReason::ProtocolViolation`].
 #[derive(Debug)]
@@ -81,8 +85,9 @@ pub struct Link {
     mtu: u16,
     deadline: Duration,
     reassembler: Reassembler,
-    /// Chunks of queued frames, in send order.
+    /// Chunks of the frames being written, in send order.
     outbox: VecDeque<Vec<u8>>,
+    queue: SendQueue,
     can_write: bool,
     /// Why we are closing; reported when the transport confirms.
     closing: Option<DisconnectReason>,
@@ -104,6 +109,7 @@ impl Link {
             deadline: Duration::ZERO,
             reassembler: Reassembler::new(config),
             outbox: VecDeque::new(),
+            queue: SendQueue::new(config),
             can_write: false,
             closing: None,
             disconnect_when_sent: false,
@@ -113,6 +119,28 @@ impl Link {
     /// The current state.
     pub fn state(&self) -> LinkState {
         self.state
+    }
+
+    /// Queues `payload` on `channel`. Before the handshake completes it
+    /// waits in the queue.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError::QueueFull`] if the channel is at its cap, or
+    /// [`SendError::LinkClosed`] once the link is closing; either way the
+    /// payload comes back unchanged.
+    pub fn send(
+        &mut self,
+        channel: Channel,
+        payload: Vec<u8>,
+    ) -> Result<Vec<LinkAction>, SendError> {
+        if matches!(self.state, LinkState::Closing | LinkState::Closed) {
+            return Err(SendError::LinkClosed(payload));
+        }
+        self.queue.push(channel, payload)?;
+        let mut out = Vec::new();
+        self.flush(&mut out);
+        Ok(out)
     }
 
     /// Feeds one transport event for this link, received at `now`.
@@ -129,10 +157,16 @@ impl Link {
                 self.can_write = true;
                 self.deadline = now + self.handshake_timeout;
                 self.state = LinkState::Handshaking;
-                self.queue(&Frame::Hello(self.local.clone()));
+                if !self.mtu_ok(&mut out) {
+                    return out;
+                }
+                self.enqueue(&Frame::Hello(self.local.clone()));
                 self.flush(&mut out);
             }
-            TransportEvent::MtuChanged { mtu, .. } => self.mtu = mtu,
+            TransportEvent::MtuChanged { mtu, .. } if self.state != LinkState::Closing => {
+                self.mtu = mtu;
+                self.mtu_ok(&mut out);
+            }
             TransportEvent::WriteReady { .. } => {
                 self.can_write = true;
                 self.flush(&mut out);
@@ -177,7 +211,7 @@ impl Link {
             _ => {
                 self.closing = Some(reason);
                 self.state = LinkState::Closing;
-                self.queue(&Frame::Bye);
+                self.enqueue(&Frame::Bye);
                 self.disconnect_when_sent = true;
                 self.flush(&mut out);
             }
@@ -209,6 +243,7 @@ impl Link {
                 Some(version) => {
                     self.state = LinkState::Ready;
                     out.push(LinkAction::Ready { remote, version });
+                    self.flush(out);
                 }
                 None => self.fail(
                     DisconnectReason::HandshakeFailed(HandshakeFailure::VersionMismatch),
@@ -234,10 +269,18 @@ impl Link {
         (low <= high).then_some(high)
     }
 
-    fn queue(&mut self, frame: &Frame) {
-        // A fragmenter error means the transport reported an MTU outside
-        // the BLE range; nothing can be sent, so the frame is dropped and
-        // the handshake timer closes the link.
+    /// Closes the link if the transport reported an MTU outside the BLE
+    /// range: no frame could be fragmented for it.
+    fn mtu_ok(&mut self, out: &mut Vec<LinkAction>) -> bool {
+        let ok = (MIN_MTU..=MAX_MTU).contains(&self.mtu);
+        if !ok {
+            self.fail(DisconnectReason::TransportLost, out);
+        }
+        ok
+    }
+
+    fn enqueue(&mut self, frame: &Frame) {
+        // Cannot fail: the MTU is checked whenever it changes.
         if let Ok(chunks) = Fragmenter::new(&frame.encode(), self.mtu) {
             self.outbox.extend(chunks);
         }
@@ -246,6 +289,11 @@ impl Link {
     fn flush(&mut self, out: &mut Vec<LinkAction>) {
         if !self.can_write {
             return;
+        }
+        if self.outbox.is_empty() && self.state == LinkState::Ready {
+            if let Some((channel, payload)) = self.queue.pop() {
+                self.enqueue(&Frame::Data { channel, payload });
+            }
         }
         if let Some(chunk) = self.outbox.pop_front() {
             self.can_write = false;
