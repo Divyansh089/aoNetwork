@@ -170,13 +170,15 @@ cargo bench                             # criterion benches in benches/
 # 3 simulated nodes exchanging data (after NET-12)
 cargo run --example sim_chat
 
-# Fuzzing (nightly toolchain): beacon_decode, frame_decode, reassembler_push
-cargo +nightly fuzz run frame_decode
+# Fuzzing (nightly toolchain): beacon_decode, frame_decode, reassembler_push.
+# New inputs land in the ignored fuzz/corpus; fuzz/seeds is checked in,
+# and each crash input is added there once fixed.
+cargo +nightly fuzz run frame_decode fuzz/corpus/frame_decode fuzz/seeds/frame_decode
 ```
 
 Tests are `cargo test` only: Miri runs in CI, and callgrind is opt-in profiling.
 
-CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A scheduled fuzzer runs every target every Sunday 00:00 IST (15 minutes each within a 60-minute job), starting from the corpus checked in under `fuzz/corpus/`, and callgrind profiling runs on manual dispatch (`.github/workflows/`). A seeded simulator suite (< 2 min) and a longer nightly run arrive with NET-09.
+CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A scheduled fuzzer runs every target every Sunday 00:00 IST (an equal share of 45 minutes within a 60-minute job), starting from the seeds checked in under `fuzz/seeds/`, and callgrind profiling runs on manual dispatch (`.github/workflows/`). A seeded simulator suite (< 2 min) and a longer nightly run arrive with NET-09.
 
 ### Using sibling crates locally
 
