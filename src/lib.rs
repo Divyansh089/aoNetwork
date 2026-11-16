@@ -53,6 +53,8 @@
 mod codec;
 mod config;
 mod error;
+#[cfg(feature = "sim")]
+mod sim;
 mod transport;
 mod types;
 
@@ -65,6 +67,8 @@ pub use error::{
     BeaconError, ConfigError, ConnectError, DisconnectReason, FragmentError, FrameError, NetError,
     SendError,
 };
+#[cfg(feature = "sim")]
+pub use sim::{NodeId, SIM_RSSI, SimConfig, SimError, SimNode, SimTransport, SimWorld};
 pub use transport::{
     AdvProfile, PowerMode, RadioState, ScanProfile, Transport, TransportCaps, TransportEvent,
 };
