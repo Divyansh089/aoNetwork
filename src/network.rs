@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use crate::{
     AdvProfile, AppHello, Beacon, BeaconFlags, Channel, DisconnectReason, FRAME_VERSION, Hello,
-    Link, LinkAction, LinkEnd, LinkId, LinkRole, LocalTag, NetworkConfig, PeerKey, PowerMode,
-    RadioState, ScanProfile, SendError, Transport, TransportEvent,
+    Link, LinkAction, LinkEnd, LinkId, LinkMetrics, LinkRole, LocalTag, NetworkConfig, PeerKey,
+    PowerMode, RadioState, ScanProfile, SendError, Transport, TransportEvent,
 };
 
 /// Something the layer above must know about.
@@ -71,6 +71,8 @@ pub struct LinkInfo {
     pub peer: PeerKey,
     /// Which side opened it.
     pub role: LinkRole,
+    /// What the link has seen so far.
+    pub metrics: LinkMetrics,
 }
 
 /// The beacon fields the layer above supplies.
@@ -262,6 +264,7 @@ impl<T: Transport> Network<T> {
                 link,
                 peer: entry.peer,
                 role: entry.role,
+                metrics: entry.machine.metrics(),
             })
             .collect()
     }
@@ -326,13 +329,12 @@ impl<T: Transport> Network<T> {
             }
             TransportEvent::Connected { link, .. }
             | TransportEvent::ConnectFailed { link, .. }
+            | TransportEvent::Rssi { link, .. }
             | TransportEvent::MtuChanged { link, .. }
             | TransportEvent::Received { link, .. }
             | TransportEvent::WriteReady { link }
             | TransportEvent::Disconnected { link, .. } => *link,
-            TransportEvent::RadioState(_)
-            | TransportEvent::Lost { .. }
-            | TransportEvent::Rssi { .. } => return,
+            TransportEvent::RadioState(_) | TransportEvent::Lost { .. } => return,
         };
         if let Some(entry) = self.links.get_mut(&link) {
             let actions = entry.machine.on_event(now, event);

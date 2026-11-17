@@ -7,9 +7,10 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ao_network::{
-    AdvProfile, AppHello, Channel, DisconnectReason, Fragmenter, HandshakeFailure, Hello, Link,
-    LinkAction, LinkEnd, LinkId, LinkRole, LocalTag, NetworkConfig, PeerKey, PowerMode, SendError,
-    SimConfig, SimNode, SimTransport, SimWorld, Transport, TransportEvent,
+    AdvProfile, AppHello, Channel, DisconnectReason, Fragmenter, Frame, HandshakeFailure, Hello,
+    Link, LinkAction, LinkEnd, LinkId, LinkMetrics, LinkRole, LinkState, LocalTag, NetworkConfig,
+    PeerKey, PowerMode, SendError, SimConfig, SimNode, SimTransport, SimWorld, Transport,
+    TransportEvent,
 };
 
 const TICK: Duration = Duration::from_millis(10);
@@ -382,4 +383,79 @@ fn an_mtu_outside_the_ble_range_closes_the_link() {
         [LinkAction::Disconnect]
     );
     assert_eq!(link.on_event(Duration::ZERO, closed), lost);
+}
+
+/// A node's only link's metrics.
+fn metrics(node: &Node) -> LinkMetrics {
+    node.links.values().next().unwrap().metrics()
+}
+
+#[test]
+fn silent_peer_is_closed_within_the_keepalive_bound() {
+    let config = NetworkConfig::default();
+    // The peer finishes the handshake, then never sends again; its Hello
+    // arrives within the first second.
+    let raw_hello = Frame::Hello(hello(1, 1, 0)).encode();
+    let bound = config.keepalive_interval() * (u32::from(config.max_missed_pongs()) + 1);
+    let (early, _) = run(Some(hello(1, 1, 0)), None, raw_hello.clone(), bound);
+    assert!(matches!(early.log[..], [LinkAction::Ready { .. }]));
+    let (late, _) = run(
+        Some(hello(1, 1, 0)),
+        None,
+        raw_hello,
+        bound + Duration::from_secs(1),
+    );
+    assert_eq!(late.down(), down(DisconnectReason::KeepaliveTimeout));
+}
+
+#[test]
+fn an_answering_peer_stays_up_and_its_rtt_is_measured() {
+    let (a, b) = run(
+        Some(hello(1, 1, 0)),
+        Some(hello(1, 1, 0)),
+        Vec::new(),
+        Duration::from_secs(100),
+    );
+    for node in [&a, &b] {
+        assert_eq!(node.down(), None);
+        let rtt = metrics(node).rtt.expect("a pong arrived");
+        // One chunk each way at the simulator's 10 ms write latency.
+        assert!(
+            rtt > Duration::ZERO && rtt <= Duration::from_millis(100),
+            "{rtt:?}"
+        );
+        assert!(metrics(node).last_rx.is_some());
+    }
+    // Nothing is in flight at the end, so every byte sent was received.
+    assert_eq!(metrics(&a).tx_bytes, metrics(&b).rx_bytes);
+    assert_eq!(metrics(&b).tx_bytes, metrics(&a).rx_bytes);
+}
+
+#[test]
+fn rssi_is_averaged_and_ignored_frames_are_counted() {
+    let receive = |frame: Frame| {
+        let chunks: Vec<_> = Fragmenter::new(&frame.encode(), MTU).unwrap().collect();
+        chunks.into_iter().map(|chunk| TransportEvent::Received {
+            link: LinkId::new(1),
+            chunk,
+        })
+    };
+    let rssi = |rssi| TransportEvent::Rssi {
+        link: LinkId::new(1),
+        rssi,
+    };
+    let mut link = Link::new(&NetworkConfig::default(), hello(1, 1, 0));
+    let mut events = vec![connected(MTU)];
+    events.extend(receive(Frame::Hello(hello(1, 1, 0))));
+    events.extend([rssi(-60), rssi(-68)]);
+    events.extend(receive(Frame::Credit { credits: 1 }));
+    // A pong no ping asked for.
+    events.extend(receive(Frame::Pong));
+    for event in events {
+        link.on_event(Duration::ZERO, event);
+    }
+    assert_eq!(link.state(), LinkState::Ready);
+    // A new sample moves the average by an eighth of the difference.
+    assert_eq!(link.metrics().rssi, Some(-61));
+    assert_eq!(link.metrics().dropped_frames, 2);
 }

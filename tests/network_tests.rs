@@ -214,6 +214,11 @@ fn payloads_over_the_peers_max_frame_come_back() {
         n[1].take().last(),
         Some(&data(back, Channel::Message, &[1; 60]))
     );
+    // links() reports each link's metrics; nothing is in flight now.
+    let sent = n[0].net.links()[0].metrics;
+    let got = n[1].net.links()[0].metrics;
+    assert!(sent.tx_bytes > 64);
+    assert_eq!(sent.tx_bytes, got.rx_bytes);
 }
 
 #[test]

@@ -12,7 +12,8 @@ use std::time::Duration;
 use crate::codec::data_frame_len;
 use crate::{
     Channel, ConnectError, DisconnectReason, Fragmenter, Frame, FrameError, HandshakeFailure,
-    Hello, MAX_MTU, MIN_MTU, NetworkConfig, Reassembler, SendError, SendQueue, TransportEvent,
+    Hello, LinkMetrics, MAX_MTU, MIN_MTU, NetworkConfig, Reassembler, SendError, SendQueue,
+    TransportEvent,
 };
 
 /// Where a link is in its lifecycle.
@@ -82,6 +83,8 @@ pub struct Link {
     local: Hello,
     max_frame: usize,
     handshake_timeout: Duration,
+    keepalive_interval: Duration,
+    max_missed_pongs: u8,
     state: LinkState,
     mtu: u16,
     deadline: Duration,
@@ -96,6 +99,11 @@ pub struct Link {
     closing: Option<DisconnectReason>,
     /// Disconnect once the outbox drains (a `Bye` is in it).
     disconnect_when_sent: bool,
+    /// When the unanswered ping went out.
+    ping_sent_at: Option<Duration>,
+    /// Pings in a row that went unanswered while nothing arrived.
+    missed_pongs: u8,
+    metrics: LinkMetrics,
 }
 
 impl Link {
@@ -107,6 +115,8 @@ impl Link {
             local,
             max_frame: config.max_frame(),
             handshake_timeout: config.handshake_timeout(),
+            keepalive_interval: config.keepalive_interval(),
+            max_missed_pongs: config.max_missed_pongs(),
             state: LinkState::Connecting,
             mtu: 0,
             deadline: Duration::ZERO,
@@ -117,7 +127,15 @@ impl Link {
             remote_max_frame: None,
             closing: None,
             disconnect_when_sent: false,
+            ping_sent_at: None,
+            missed_pongs: 0,
+            metrics: LinkMetrics::default(),
         }
+    }
+
+    /// What this link has seen so far.
+    pub fn metrics(&self) -> LinkMetrics {
+        self.metrics
     }
 
     /// The current state.
@@ -126,11 +144,19 @@ impl Link {
     }
 
     /// When [`on_tick`](Self::on_tick) next has work: the handshake
-    /// deadline, or the reassembly deadline of a partial frame.
+    /// deadline, or on a ready link the next keepalive step or the
+    /// reassembly deadline of a partial frame.
     pub fn next_deadline(&self) -> Option<Duration> {
         match self.state {
             LinkState::Negotiating | LinkState::Handshaking => Some(self.deadline),
-            LinkState::Ready => self.reassembler.deadline(),
+            LinkState::Ready => {
+                let keepalive = self.keepalive_at();
+                Some(
+                    self.reassembler
+                        .deadline()
+                        .map_or(keepalive, |d| d.min(keepalive)),
+                )
+            }
             _ => None,
         }
     }
@@ -193,7 +219,13 @@ impl Link {
                 self.can_write = true;
                 self.flush(&mut out);
             }
-            TransportEvent::Received { chunk, .. } => self.receive(now, &chunk, &mut out),
+            TransportEvent::Received { chunk, .. } => {
+                self.metrics.on_rx(now, chunk.len());
+                // Anything from the peer shows it is alive.
+                self.missed_pongs = 0;
+                self.receive(now, &chunk, &mut out);
+            }
+            TransportEvent::Rssi { rssi, .. } => self.metrics.on_rssi(rssi),
             TransportEvent::ConnectFailed { error, .. } => {
                 self.end(LinkEnd::ConnectFailed(error), &mut out);
             }
@@ -206,7 +238,13 @@ impl Link {
         out
     }
 
-    /// Runs the handshake and reassembly timers at `now`.
+    /// Runs the handshake, keepalive and reassembly timers at `now`.
+    ///
+    /// A ready link pings after `keepalive_interval` with nothing
+    /// received, and again each `keepalive_interval` without a pong. It
+    /// closes with [`DisconnectReason::KeepaliveTimeout`] after
+    /// `max_missed_pongs` such pings in a row, so a silent peer is closed
+    /// `keepalive_interval x (max_missed_pongs + 1)` after it last sent.
     pub fn on_tick(&mut self, now: Duration) -> Vec<LinkAction> {
         let mut out = Vec::new();
         let handshaking = matches!(self.state, LinkState::Negotiating | LinkState::Handshaking);
@@ -220,8 +258,32 @@ impl Link {
             );
         } else if self.reassembler.poll_timeout(now).is_err() {
             self.fail(DisconnectReason::ProtocolViolation, &mut out);
+        } else if self.state == LinkState::Ready && now >= self.keepalive_at() {
+            self.keepalive(now, &mut out);
         }
         out
+    }
+
+    /// When the next ping is due: an interval after the unanswered ping,
+    /// or after the last chunk received.
+    fn keepalive_at(&self) -> Duration {
+        let since = self
+            .ping_sent_at
+            .or(self.metrics.last_rx)
+            .unwrap_or(Duration::ZERO);
+        since.saturating_add(self.keepalive_interval)
+    }
+
+    fn keepalive(&mut self, now: Duration, out: &mut Vec<LinkAction>) {
+        if self.ping_sent_at.is_some() {
+            self.missed_pongs = self.missed_pongs.saturating_add(1);
+            if self.missed_pongs >= self.max_missed_pongs {
+                return self.fail(DisconnectReason::KeepaliveTimeout, out);
+            }
+        }
+        self.ping_sent_at = Some(now);
+        self.enqueue(&Frame::Ping);
+        self.flush(out);
     }
 
     /// Closes the link for `reason`. A connected link says `Bye` first.
@@ -280,8 +342,16 @@ impl Link {
             (LinkState::Ready | LinkState::Handshaking, Frame::Bye) => {
                 self.fail(DisconnectReason::Bye, out);
             }
-            // Keepalive (NET-13) and credits (NET-25) are not handled yet.
-            (LinkState::Ready, Frame::Ping | Frame::Pong | Frame::Credit { .. }) => {}
+            (LinkState::Ready, Frame::Ping) => {
+                self.enqueue(&Frame::Pong);
+                self.flush(out);
+            }
+            (LinkState::Ready, Frame::Pong) => match self.ping_sent_at.take() {
+                Some(sent) => self.metrics.on_rtt(now.saturating_sub(sent)),
+                None => self.metrics.on_dropped(),
+            },
+            // Credits are reserved until flow control (NET-25).
+            (LinkState::Ready, Frame::Credit { .. }) => self.metrics.on_dropped(),
             _ => self.fail(DisconnectReason::ProtocolViolation, out),
         }
     }
@@ -321,6 +391,7 @@ impl Link {
         }
         if let Some(chunk) = self.outbox.pop_front() {
             self.can_write = false;
+            self.metrics.on_tx(chunk.len());
             out.push(LinkAction::Write(chunk));
         } else if self.disconnect_when_sent {
             self.disconnect_when_sent = false;

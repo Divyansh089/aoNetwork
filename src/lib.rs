@@ -54,6 +54,7 @@ mod codec;
 mod config;
 mod error;
 mod link;
+mod metrics;
 mod network;
 mod queue;
 #[cfg(feature = "sim")]
@@ -71,6 +72,7 @@ pub use error::{
     HandshakeFailure, NetError, SendError,
 };
 pub use link::{Link, LinkAction, LinkEnd, LinkState};
+pub use metrics::LinkMetrics;
 pub use network::{LinkInfo, Network, NetworkEvent};
 pub use queue::SendQueue;
 #[cfg(feature = "sim")]
