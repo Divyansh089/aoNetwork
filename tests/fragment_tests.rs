@@ -139,3 +139,16 @@ fn timeout_is_measured_from_start_and_drops_the_frame() {
     assert_eq!(r.poll_timeout(timeout * 3), Ok(()));
     assert_idle(&mut r, timeout * 3);
 }
+
+#[test]
+fn deadline_runs_from_the_first_chunk_of_a_partial_frame() {
+    let config = NetworkConfig::default();
+    let mut r = Reassembler::new(&config);
+    assert_eq!(r.deadline(), None);
+    let start = Duration::from_secs(1);
+    // START without END: the frame stays partial.
+    assert_eq!(r.push(start, &[0x80, 1]), Ok(None));
+    assert_eq!(r.deadline(), Some(start + config.reassembly_timeout()));
+    assert_eq!(r.push(start * 2, &[0x41, 2]), Ok(Some(vec![1, 2])));
+    assert_eq!(r.deadline(), None);
+}

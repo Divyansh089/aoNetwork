@@ -54,6 +54,7 @@ mod codec;
 mod config;
 mod error;
 mod link;
+mod network;
 mod queue;
 #[cfg(feature = "sim")]
 mod sim;
@@ -70,6 +71,7 @@ pub use error::{
     HandshakeFailure, NetError, SendError,
 };
 pub use link::{Link, LinkAction, LinkEnd, LinkState};
+pub use network::{LinkInfo, Network, NetworkEvent};
 pub use queue::SendQueue;
 #[cfg(feature = "sim")]
 pub use sim::{NodeId, SIM_RSSI, SimConfig, SimError, SimNode, SimTransport, SimWorld};
