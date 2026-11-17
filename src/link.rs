@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use crate::codec::data_frame_len;
 use crate::{
     Channel, ConnectError, DisconnectReason, Fragmenter, Frame, FrameError, HandshakeFailure,
     Hello, MAX_MTU, MIN_MTU, NetworkConfig, Reassembler, SendError, SendQueue, TransportEvent,
@@ -89,6 +90,8 @@ pub struct Link {
     outbox: VecDeque<Vec<u8>>,
     queue: SendQueue,
     can_write: bool,
+    /// The peer's `max_frame`, once its `Hello` has arrived.
+    remote_max_frame: Option<usize>,
     /// Why we are closing; reported when the transport confirms.
     closing: Option<DisconnectReason>,
     /// Disconnect once the outbox drains (a `Bye` is in it).
@@ -111,6 +114,7 @@ impl Link {
             outbox: VecDeque::new(),
             queue: SendQueue::new(config),
             can_write: false,
+            remote_max_frame: None,
             closing: None,
             disconnect_when_sent: false,
         }
@@ -121,14 +125,26 @@ impl Link {
         self.state
     }
 
+    /// When [`on_tick`](Self::on_tick) next has work: the handshake
+    /// deadline, or the reassembly deadline of a partial frame.
+    pub fn next_deadline(&self) -> Option<Duration> {
+        match self.state {
+            LinkState::Negotiating | LinkState::Handshaking => Some(self.deadline),
+            LinkState::Ready => self.reassembler.deadline(),
+            _ => None,
+        }
+    }
+
     /// Queues `payload` on `channel`. Before the handshake completes it
-    /// waits in the queue.
+    /// waits in the queue, unchecked against the peer's `max_frame`, which
+    /// is not known yet.
     ///
     /// # Errors
     ///
-    /// [`SendError::QueueFull`] if the channel is at its cap, or
-    /// [`SendError::LinkClosed`] once the link is closing; either way the
-    /// payload comes back unchanged.
+    /// [`SendError::QueueFull`] if the channel is at its cap,
+    /// [`SendError::TooLarge`] if its frame exceeds the peer's `max_frame`,
+    /// or [`SendError::LinkClosed`] once the link is closing; each returns
+    /// the payload unchanged.
     pub fn send(
         &mut self,
         channel: Channel,
@@ -136,6 +152,12 @@ impl Link {
     ) -> Result<Vec<LinkAction>, SendError> {
         if matches!(self.state, LinkState::Closing | LinkState::Closed) {
             return Err(SendError::LinkClosed(payload));
+        }
+        if self
+            .remote_max_frame
+            .is_some_and(|max| data_frame_len(payload.len()) > max)
+        {
+            return Err(SendError::TooLarge(payload));
         }
         self.queue.push(channel, payload)?;
         let mut out = Vec::new();
@@ -242,6 +264,8 @@ impl Link {
             (LinkState::Handshaking, Frame::Hello(remote)) => match self.agree(&remote) {
                 Some(version) => {
                     self.state = LinkState::Ready;
+                    self.remote_max_frame =
+                        Some(usize::try_from(remote.max_frame).unwrap_or(usize::MAX));
                     out.push(LinkAction::Ready { remote, version });
                     self.flush(out);
                 }

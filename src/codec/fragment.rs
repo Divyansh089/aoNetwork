@@ -181,6 +181,13 @@ impl Reassembler {
         Ok(())
     }
 
+    /// When the partial frame expires, if one is in progress.
+    pub fn deadline(&self) -> Option<Duration> {
+        self.in_flight
+            .as_ref()
+            .map(|f| f.started_at.saturating_add(self.timeout))
+    }
+
     fn expired(&self, now: Duration) -> bool {
         self.in_flight
             .as_ref()

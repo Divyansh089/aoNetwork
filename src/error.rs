@@ -307,6 +307,10 @@ pub enum SendError {
     /// The link is closing or closed. The payload is returned untouched.
     #[error("link closed; payload returned to the caller")]
     LinkClosed(Vec<u8>),
+    /// The payload's frame exceeds the peer's `max_frame`, so the peer
+    /// would reject it. The payload is returned untouched.
+    #[error("payload too large for the peer; payload returned to the caller")]
+    TooLarge(Vec<u8>),
 }
 
 impl SendError {
@@ -322,7 +326,9 @@ impl SendError {
     /// ```
     pub fn into_payload(self) -> Vec<u8> {
         match self {
-            Self::QueueFull(payload) | Self::LinkClosed(payload) => payload,
+            Self::QueueFull(payload) | Self::LinkClosed(payload) | Self::TooLarge(payload) => {
+                payload
+            }
         }
     }
 }
