@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use crate::Channel;
 use crate::error::ConfigError;
 
 // Hard bounds. These catch unit errors and bound memory; they are not policy
@@ -28,6 +29,9 @@ const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_MAX_MISSED_PONGS: u8 = 3;
 const DEFAULT_MAX_FRAME: usize = 16 * 1024;
 const DEFAULT_QUEUE_CAP: usize = 128 * 1024;
+// Control, Message, Telemetry, Bulk. Each holds one default-size frame and
+// together they fill `DEFAULT_QUEUE_CAP`.
+const DEFAULT_CHANNEL_CAPS: [usize; 4] = [16 * 1024, 48 * 1024, 16 * 1024, 48 * 1024];
 
 /// Link-layer configuration with validated defaults.
 ///
@@ -41,6 +45,7 @@ const DEFAULT_QUEUE_CAP: usize = 128 * 1024;
 /// | `max_missed_pongs` | 3 | >= 1 |
 /// | `max_frame` | 16 KiB | 64 B..=1 MiB |
 /// | `queue_cap` | 128 KiB per link | `max_frame`..=1 MiB |
+/// | `channel_cap` | Control 16, Message 48, Telemetry 16, Bulk 48 KiB | each >= 64 B, sum <= `queue_cap` |
 ///
 /// Start from [`Default`] and chain the setters; each returns
 /// `Result<Self, ConfigError>` and validates the **whole** configuration, so
@@ -75,6 +80,7 @@ pub struct NetworkConfig {
     max_missed_pongs: u8,
     max_frame: usize,
     queue_cap: usize,
+    channel_caps: [usize; 4],
 }
 
 impl NetworkConfig {
@@ -123,6 +129,28 @@ impl NetworkConfig {
                 value: self.queue_cap,
                 min: self.max_frame,
                 max: MAX_QUEUE_CAP,
+            });
+        }
+        for channel in Channel::ALL {
+            let value = self.channel_caps[channel.index()];
+            if value < MIN_FRAME {
+                return Err(ConfigError::ChannelCapTooSmall {
+                    channel,
+                    value,
+                    min: MIN_FRAME,
+                });
+            }
+        }
+        // Saturating: a setter may pass any usize, and a wrapped sum could
+        // pass the check.
+        let total = self
+            .channel_caps
+            .iter()
+            .fold(0usize, |sum, &cap| sum.saturating_add(cap));
+        if total > self.queue_cap {
+            return Err(ConfigError::ChannelCapsOverQueueCap {
+                total,
+                queue_cap: self.queue_cap,
             });
         }
         Ok(())
@@ -216,9 +244,21 @@ impl NetworkConfig {
     /// Sets the per-link send-queue byte cap (default: 128 KiB).
     ///
     /// Must be at least `max_frame` (or the current `max_frame` is lowered
-    /// first) and at most 1 MiB.
+    /// first), at most 1 MiB, and no less than the sum of the channel caps
+    /// (lower those first).
     pub fn with_queue_cap(mut self, queue_cap: usize) -> Result<Self, ConfigError> {
         self.queue_cap = queue_cap;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Sets the send-queue byte cap of one channel on each link.
+    ///
+    /// Must be at least 64 B, and the four caps together must fit in
+    /// `queue_cap`, so a flood on one channel never takes another's room.
+    /// Bytes are counted as encoded `Data` frames.
+    pub fn with_channel_cap(mut self, channel: Channel, cap: usize) -> Result<Self, ConfigError> {
+        self.channel_caps[channel.index()] = cap;
         self.validate()?;
         Ok(self)
     }
@@ -262,6 +302,11 @@ impl NetworkConfig {
     pub fn queue_cap(&self) -> usize {
         self.queue_cap
     }
+
+    /// The send-queue byte cap of `channel` on each link.
+    pub fn channel_cap(&self, channel: Channel) -> usize {
+        self.channel_caps[channel.index()]
+    }
 }
 
 impl Default for NetworkConfig {
@@ -277,6 +322,7 @@ impl Default for NetworkConfig {
             max_missed_pongs: DEFAULT_MAX_MISSED_PONGS,
             max_frame: DEFAULT_MAX_FRAME,
             queue_cap: DEFAULT_QUEUE_CAP,
+            channel_caps: DEFAULT_CHANNEL_CAPS,
         }
     }
 }
@@ -297,6 +343,10 @@ mod tests {
         assert_eq!(cfg.max_missed_pongs(), 3);
         assert_eq!(cfg.max_frame(), 16 * 1024);
         assert_eq!(cfg.queue_cap(), 128 * 1024);
+        assert_eq!(cfg.channel_cap(Channel::Control), 16 * 1024);
+        assert_eq!(cfg.channel_cap(Channel::Message), 48 * 1024);
+        assert_eq!(cfg.channel_cap(Channel::Telemetry), 16 * 1024);
+        assert_eq!(cfg.channel_cap(Channel::Bulk), 48 * 1024);
     }
 
     #[test]
@@ -452,7 +502,10 @@ mod tests {
             }
         );
         assert_eq!(
-            base.clone().with_queue_cap(16 * 1024).unwrap().queue_cap(),
+            small_channels(&base)
+                .with_queue_cap(16 * 1024)
+                .unwrap()
+                .queue_cap(),
             16 * 1024
         );
 
@@ -504,6 +557,10 @@ mod tests {
             .unwrap()
             .with_max_frame(4096)
             .unwrap()
+            .with_channel_cap(Channel::Message, 16 * 1024)
+            .unwrap()
+            .with_channel_cap(Channel::Bulk, 16 * 1024)
+            .unwrap()
             .with_queue_cap(64 * 1024)
             .unwrap();
         assert_eq!(cfg.max_links(), 3);
@@ -513,7 +570,76 @@ mod tests {
         assert_eq!(cfg.max_missed_pongs(), 5);
         assert_eq!(cfg.max_frame(), 4096);
         assert_eq!(cfg.queue_cap(), 64 * 1024);
+        assert_eq!(cfg.channel_cap(Channel::Message), 16 * 1024);
+        assert_eq!(cfg.channel_cap(Channel::Bulk), 16 * 1024);
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    /// `base` with every channel capped at 4 KiB (16 KiB in total).
+    fn small_channels(base: &NetworkConfig) -> NetworkConfig {
+        Channel::ALL.into_iter().fold(base.clone(), |cfg, channel| {
+            cfg.with_channel_cap(channel, 4 * 1024).unwrap()
+        })
+    }
+
+    #[test]
+    fn channel_cap_below_the_smallest_frame_is_rejected() {
+        let base = NetworkConfig::default();
+        assert_eq!(
+            base.clone()
+                .with_channel_cap(Channel::Telemetry, 63)
+                .unwrap_err(),
+            ConfigError::ChannelCapTooSmall {
+                channel: Channel::Telemetry,
+                value: 63,
+                min: 64
+            }
+        );
+        assert_eq!(
+            base.with_channel_cap(Channel::Telemetry, 64)
+                .unwrap()
+                .channel_cap(Channel::Telemetry),
+            64
+        );
+    }
+
+    #[test]
+    fn channel_caps_must_fit_in_queue_cap() {
+        let base = NetworkConfig::default();
+        // Defaults fill queue_cap exactly, so any growth overflows it.
+        assert_eq!(
+            base.clone()
+                .with_channel_cap(Channel::Control, 16 * 1024 + 1)
+                .unwrap_err(),
+            ConfigError::ChannelCapsOverQueueCap {
+                total: 128 * 1024 + 1,
+                queue_cap: 128 * 1024
+            }
+        );
+        // Shrinking queue_cap below the caps fails the same way.
+        assert_eq!(
+            base.clone().with_queue_cap(64 * 1024).unwrap_err(),
+            ConfigError::ChannelCapsOverQueueCap {
+                total: 128 * 1024,
+                queue_cap: 64 * 1024
+            }
+        );
+        // A huge cap saturates the total instead of wrapping past the check.
+        assert_eq!(
+            base.clone()
+                .with_channel_cap(Channel::Bulk, usize::MAX)
+                .unwrap_err(),
+            ConfigError::ChannelCapsOverQueueCap {
+                total: usize::MAX,
+                queue_cap: 128 * 1024
+            }
+        );
+        let raised = base
+            .with_queue_cap(256 * 1024)
+            .unwrap()
+            .with_channel_cap(Channel::Bulk, 176 * 1024)
+            .unwrap();
+        assert_eq!(raised.channel_cap(Channel::Bulk), 176 * 1024);
     }
 
     #[test]

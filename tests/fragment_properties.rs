@@ -49,11 +49,7 @@ proptest! {
     fn hostile_chunks_never_panic_or_exceed_max_frame(
         chunks in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..48), 0..32),
     ) {
-        let config = NetworkConfig::default()
-            .with_max_frame(64)
-            .unwrap()
-            .with_queue_cap(64)
-            .unwrap();
+        let config = NetworkConfig::default().with_max_frame(64).unwrap();
         let mut reassembler = Reassembler::new(&config);
         for chunk in &chunks {
             if let Ok(Some(frame)) = reassembler.push(Duration::ZERO, chunk) {

@@ -227,14 +227,17 @@ impl Frame {
                 let len = hello.app_hello.as_bytes().len();
                 HELLO_FIXED_LEN + varint::encoded_len(len as u64) + len
             }
-            Self::Data { payload, .. } => {
-                1 + varint::encoded_len(payload.len() as u64) + payload.len()
-            }
+            Self::Data { payload, .. } => return data_frame_len(payload.len()),
             Self::Ping | Self::Pong | Self::Bye => 0,
             Self::Credit { .. } => 4,
         };
         HEADER_LEN + body
     }
+}
+
+/// Encoded size of a `Data` frame carrying `payload_len` bytes.
+pub(crate) fn data_frame_len(payload_len: usize) -> usize {
+    HEADER_LEN + 1 + varint::encoded_len(payload_len as u64) + payload_len
 }
 
 fn decode_hello(reader: &mut Reader<'_>) -> Result<Hello, FrameError> {

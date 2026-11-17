@@ -7,9 +7,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ao_network::{
-    AdvProfile, AppHello, DisconnectReason, Fragmenter, HandshakeFailure, Hello, Link, LinkAction,
-    LinkEnd, LinkId, LinkRole, LocalTag, NetworkConfig, PowerMode, SimConfig, SimNode,
-    SimTransport, SimWorld, Transport, TransportEvent,
+    AdvProfile, AppHello, Channel, DisconnectReason, Fragmenter, HandshakeFailure, Hello, Link,
+    LinkAction, LinkEnd, LinkId, LinkRole, LocalTag, NetworkConfig, PeerKey, PowerMode, SendError,
+    SimConfig, SimNode, SimTransport, SimWorld, Transport, TransportEvent,
 };
 
 const TICK: Duration = Duration::from_millis(10);
@@ -114,6 +114,24 @@ impl Node {
             self.apply(link, actions);
         }
         self.raw_flush();
+    }
+
+    /// Sends on this node's only link.
+    fn send(&mut self, channel: Channel, payload: Vec<u8>) {
+        let (&link, machine) = self.links.iter_mut().next().unwrap();
+        let actions = machine.send(channel, payload).unwrap();
+        self.apply(link, actions);
+    }
+
+    /// Data payloads received so far, in order.
+    fn data(&self) -> Vec<(Channel, Vec<u8>)> {
+        self.log
+            .iter()
+            .filter_map(|action| match action {
+                LinkAction::Data { channel, payload } => Some((*channel, payload.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     fn raw_event(&mut self, event: &TransportEvent) {
@@ -263,4 +281,105 @@ fn close_says_bye_and_each_side_reports_its_reason() {
     }
     assert_eq!(a.down(), down(DisconnectReason::DegreeCap));
     assert_eq!(b.down(), down(DisconnectReason::Bye));
+}
+
+#[test]
+fn control_waits_at_most_one_frame_behind_bulk() {
+    let config = SimConfig::default();
+    let world = SimWorld::new(config);
+    let mut a = Node::new(&world, Some(hello(1, 1, 0)));
+    let mut b = Node::new(&world, Some(hello(1, 1, 0)));
+    world.set_in_range(a.radio.node(), b.radio.node(), true);
+    a.connect(&b);
+    // Queued before the handshake; flows once the link is ready.
+    let bulk: Vec<Vec<u8>> = (0..10).map(|i| vec![i; 500]).collect();
+    for payload in &bulk {
+        a.send(Channel::Bulk, payload.clone());
+    }
+    let tick = |a: &mut Node, b: &mut Node| {
+        world.advance(TICK);
+        a.step(world.now());
+        b.step(world.now());
+    };
+    while b.data().len() < 2 {
+        tick(&mut a, &mut b);
+    }
+
+    let sent_at = world.now();
+    a.send(Channel::Control, vec![0xC0; 4]);
+    while !b.data().contains(&(Channel::Control, vec![0xC0; 4])) {
+        tick(&mut a, &mut b);
+    }
+    // One chunk per write: the rest of the Bulk frame in flight, then the
+    // Control frame itself, plus one tick of polling.
+    let chunks = |payload: usize| (payload + 5).div_ceil(usize::from(MTU) - 4) as u32;
+    let bound = config.write_latency * (chunks(500) + chunks(4)) + TICK;
+    assert!(
+        world.now() - sent_at <= bound,
+        "{:?}",
+        world.now() - sent_at
+    );
+
+    while b.data().len() < bulk.len() + 1 {
+        tick(&mut a, &mut b);
+    }
+    // Control overtook the queued Bulk, which arrived complete and in order.
+    let data = b.data();
+    assert!(data[data.len() - 1].0 == Channel::Bulk);
+    let received: Vec<_> = data
+        .into_iter()
+        .filter(|(channel, _)| *channel == Channel::Bulk)
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(received, bulk);
+}
+
+fn connected(mtu: u16) -> TransportEvent {
+    TransportEvent::Connected {
+        link: LinkId::new(1),
+        peer: PeerKey::new([1; 16]),
+        role: LinkRole::Initiator,
+        mtu,
+    }
+}
+
+#[test]
+fn send_on_a_closing_link_returns_the_payload() {
+    let mut link = Link::new(&NetworkConfig::default(), hello(1, 1, 0));
+    link.on_event(Duration::ZERO, connected(MTU));
+    link.close(DisconnectReason::Closed);
+    assert_eq!(
+        link.send(Channel::Message, vec![9; 3]),
+        Err(SendError::LinkClosed(vec![9; 3]))
+    );
+}
+
+#[test]
+fn an_mtu_outside_the_ble_range_closes_the_link() {
+    let lost = [LinkAction::Down(LinkEnd::Disconnected(
+        DisconnectReason::TransportLost,
+    ))];
+    let closed = TransportEvent::Disconnected {
+        link: LinkId::new(1),
+        reason: DisconnectReason::Closed,
+    };
+
+    let mut link = Link::new(&NetworkConfig::default(), hello(1, 1, 0));
+    assert_eq!(
+        link.on_event(Duration::ZERO, connected(MTU - 1)),
+        [LinkAction::Disconnect]
+    );
+    assert_eq!(link.on_event(Duration::ZERO, closed.clone()), lost);
+
+    let mut link = Link::new(&NetworkConfig::default(), hello(1, 1, 0));
+    link.on_event(Duration::ZERO, connected(MTU));
+    let changed = TransportEvent::MtuChanged {
+        link: LinkId::new(1),
+        mtu: 518,
+    };
+    assert_eq!(
+        link.on_event(Duration::ZERO, changed),
+        [LinkAction::Disconnect]
+    );
+    assert_eq!(link.on_event(Duration::ZERO, closed), lost);
 }

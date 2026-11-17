@@ -17,7 +17,6 @@ fuzz_target!(|data: &[u8]| {
     // Fixed, known-valid values; a failure here is a harness bug, not input.
     let config = NetworkConfig::default()
         .with_max_frame(MAX_FRAME)
-        .and_then(|c| c.with_queue_cap(MAX_FRAME))
         .and_then(|c| c.with_reassembly_timeout(Duration::from_millis(200)))
         .expect("valid fuzz config");
     let mut reassembler = Reassembler::new(&config);

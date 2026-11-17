@@ -5,6 +5,8 @@
 //! `#[non_exhaustive]` so later issues (codec, transport, topology) can add
 //! variants without breaking downstream matches.
 
+use crate::Channel;
+
 /// A configuration value failed validation.
 ///
 /// Returned by the `NetworkConfig::with_*` setters; no invalid configuration
@@ -74,6 +76,27 @@ pub enum ConfigError {
         min: usize,
         /// Inclusive upper bound.
         max: usize,
+    },
+
+    /// A channel's byte cap is below the smallest allowed frame.
+    #[error("{channel:?} cap must be at least {min} bytes, got {value}")]
+    ChannelCapTooSmall {
+        /// The channel.
+        channel: Channel,
+        /// The rejected value.
+        value: usize,
+        /// Inclusive lower bound.
+        min: usize,
+    },
+
+    /// The channel caps add up to more than `queue_cap`, the per-link
+    /// memory budget they share.
+    #[error("channel caps total {total} bytes, over queue_cap {queue_cap}")]
+    ChannelCapsOverQueueCap {
+        /// Sum of the four channel caps.
+        total: usize,
+        /// The current `queue_cap`.
+        queue_cap: usize,
     },
 }
 
@@ -281,6 +304,9 @@ pub enum SendError {
     /// returned to the caller untouched so it can be retried or surfaced.
     #[error("send queue full; payload returned to the caller")]
     QueueFull(Vec<u8>),
+    /// The link is closing or closed. The payload is returned untouched.
+    #[error("link closed; payload returned to the caller")]
+    LinkClosed(Vec<u8>),
 }
 
 impl SendError {
@@ -296,7 +322,7 @@ impl SendError {
     /// ```
     pub fn into_payload(self) -> Vec<u8> {
         match self {
-            Self::QueueFull(payload) => payload,
+            Self::QueueFull(payload) | Self::LinkClosed(payload) => payload,
         }
     }
 }

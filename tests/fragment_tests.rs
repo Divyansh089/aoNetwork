@@ -93,11 +93,7 @@ fn start_while_busy_drops_the_frame() {
 
 #[test]
 fn frame_over_max_frame_is_dropped() {
-    let config = NetworkConfig::default()
-        .with_max_frame(64)
-        .unwrap()
-        .with_queue_cap(64)
-        .unwrap();
+    let config = NetworkConfig::default().with_max_frame(64).unwrap();
     let mut r = Reassembler::new(&config);
 
     let mut single = vec![0xC0];
