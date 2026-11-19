@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Opportunistic links (NET-22): once a node holds its stable target, a
+  peer whose beacon digest is new to it (a first sighting included, so a
+  node passing by) is dialed into the single opportunistic slot, ahead of
+  a fourth stable or the explore link, and an inbound link may take that
+  slot when no stable or explore slot is left. The dial follows the
+  hint rule and initiation delay of NET-17 and is retried on every
+  sighting while the digest stays new to the node. The new
+  `Network::release(now, link)` closes such a link once the layer above
+  has synced over it; otherwise it ends after a 60 s dwell with
+  `DegreeCap`. Its peer's hint is then barred from new links in either
+  direction for 60 s unless the peer's digest changes again. Eviction no
+  longer counts opportunistic links against the stable target.
 - Discovery mode controller (NET-19): `Network` picks a `DiscoveryMode`
   from its degree and battery and scans and advertises accordingly -
   `Aggressive` (low latency) below the stable target, `Normal`
