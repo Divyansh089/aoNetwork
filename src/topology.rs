@@ -23,6 +23,12 @@
 //! other side waits [`INITIATION_DELAY`] first, so its own connection
 //! is normally made redundant by the inbound one. When both connect
 //! anyway, [`duplicate_loser`] picks the one link both ends close.
+//!
+//! The opportunistic slot (NET-22) holds a short link to a peer whose
+//! beacon digest changed, once the node has reached its stable target,
+//! so the layers above can sync with a passing node. It ends on release
+//! or after [`DWELL`], and [`Cooldowns`] then bars the peer's hint for
+//! [`COOLDOWN`] unless its digest changes again.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -63,8 +69,8 @@ pub(crate) enum LinkClass {
     /// The single slot above the stable target that keeps a node
     /// looking past its immediate neighbourhood.
     Explore,
-    /// A temporary slot held only while its conditions last (NET-22).
-    #[allow(dead_code)] // Constructed by NET-22's opportunistic admission, not yet written.
+    /// A temporary slot for a peer whose beacon digest changed, held
+    /// until released or for at most the dwell time.
     Opportunistic,
 }
 
@@ -77,6 +83,8 @@ pub(crate) struct ClassCounts {
     pub(crate) stable: usize,
     /// Entries admitted as explore.
     pub(crate) explore: usize,
+    /// Entries admitted as opportunistic.
+    pub(crate) opportunistic: usize,
 }
 
 /// The candidate score: strong signal first, lightly loaded peers
@@ -105,7 +113,6 @@ pub(crate) struct TopologyPolicy {
     /// Explore links that may be held at once.
     pub(crate) explore_slots: usize,
     /// Opportunistic links that may be held at once.
-    #[allow(dead_code)] // Enforced by NET-22; stored so the policy owns every listed knob.
     pub(crate) opportunistic_slots: usize,
     /// The configured cap on total links.
     pub(crate) max_total: usize,
@@ -116,11 +123,10 @@ pub(crate) struct TopologyPolicy {
     pub(crate) link_min_age: Duration,
     /// How long the higher-hint side of a pair holds back its dial.
     pub(crate) initiation_delay: Duration,
-    /// How long an opportunistic link may hold its slot (NET-22).
-    #[allow(dead_code)] // Enforced by NET-22; stored so the policy owns every listed knob.
+    /// How long an opportunistic link may hold its slot.
     pub(crate) dwell: Duration,
-    /// Per-hint bar after losing a slot (NET-22).
-    #[allow(dead_code)] // Enforced by NET-22; stored so the policy owns every listed knob.
+    /// How long a hint stays barred after its opportunistic link ends,
+    /// unless its digest changes.
     pub(crate) cooldown: Duration,
     /// The cap admission uses now: `max_total`, lowered for the
     /// session after repeated rejections.
@@ -157,7 +163,8 @@ impl TopologyPolicy {
 
     /// The class the next inbound or outbound link is admitted as, or
     /// `None` when no slot is free: stable first, then the explore
-    /// slot, and never the opportunistic slot (NET-22 owns it).
+    /// slot, and never the opportunistic slot, which
+    /// [`admit_opportunistic`](Self::admit_opportunistic) decides.
     pub(crate) fn admit(&self, counts: &ClassCounts) -> Option<LinkClass> {
         if counts.total >= self.effective_cap {
             return None;
@@ -169,6 +176,15 @@ impl TopologyPolicy {
             return Some(LinkClass::Explore);
         }
         None
+    }
+
+    /// Whether an opportunistic link may be admitted now: the node has
+    /// reached its stable target, the opportunistic slot is free, and
+    /// the total stays within the effective cap.
+    pub(crate) fn admit_opportunistic(&self, counts: &ClassCounts) -> bool {
+        counts.stable >= self.target_stable
+            && counts.opportunistic < self.opportunistic_slots
+            && counts.total < self.effective_cap
     }
 
     /// Records that an outbound attempt came back
@@ -223,6 +239,9 @@ pub(crate) struct DiscoveredPeer {
     pub(crate) failures: u8,
     /// Earliest time a connect attempt may start.
     pub(crate) next_attempt_at: Duration,
+    /// Its digest is new to this node: it changed, or first decoded,
+    /// since a link to it last came up.
+    pub(crate) unsynced: bool,
 }
 
 /// The peer table: bounded by `max_peers`, evicting the stalest
@@ -263,6 +282,8 @@ impl PeerTable {
             entry.last_seen = now;
             entry.rssi = rssi_ewma(entry.rssi, rssi);
             if let Some(decoded) = beacon {
+                let old = entry.beacon.map(|old| old.digest);
+                entry.unsynced |= old != Some(decoded.digest);
                 entry.beacon = Some(decoded);
             }
             return beacon.is_some();
@@ -294,6 +315,7 @@ impl PeerTable {
                 state: PeerState::Idle,
                 failures: 0,
                 next_attempt_at: Duration::ZERO,
+                unsynced: beacon.is_some(),
             },
         );
         beacon.is_some()
@@ -306,13 +328,21 @@ impl PeerTable {
         }
     }
 
-    /// Records a successful handshake: linked, and the failure streak is
-    /// over, so a later drop backs off from a clean slate.
+    /// Records a successful handshake: linked, the failure streak is
+    /// over, so a later drop backs off from a clean slate, and the peer's
+    /// digest is no longer new.
     pub(crate) fn mark_linked(&mut self, peer: &PeerKey) {
         if let Some(entry) = self.entries.get_mut(peer) {
             entry.state = PeerState::Linked;
             entry.failures = 0;
+            entry.unsynced = false;
         }
+    }
+
+    /// Whether `peer`'s digest is new to this node since a link to it
+    /// last came up: the trigger for an opportunistic link.
+    pub(crate) fn unsynced(&self, peer: &PeerKey) -> bool {
+        self.entries.get(peer).is_some_and(|entry| entry.unsynced)
     }
 
     /// Records that the attempt or link to `peer` ended at `now` without
@@ -392,7 +422,12 @@ impl PeerTable {
 
     /// The peer's latest advertised hint, for the connect tie-break.
     pub(crate) fn hint_of(&self, peer: &PeerKey) -> Option<[u8; 8]> {
-        self.entries.get(peer)?.beacon.map(|beacon| beacon.hint)
+        self.beacon_of(peer).map(|beacon| beacon.hint)
+    }
+
+    /// The peer's latest decoded beacon.
+    pub(crate) fn beacon_of(&self, peer: &PeerKey) -> Option<Beacon> {
+        self.entries.get(peer)?.beacon
     }
 
     /// Whether `delay` has passed at `now` since `peer` last became
@@ -454,6 +489,58 @@ pub(crate) fn duplicate_loser(held: &ReadyLink, new: &ReadyLink) -> Option<LinkI
         Ordering::Less => Some(new.link),
         Ordering::Greater => Some(held.link),
         Ordering::Equal => (new.role == LinkRole::Initiator).then_some(new.link),
+    }
+}
+
+/// Hints barred from new links after their opportunistic link ended.
+///
+/// Each entry remembers the digest the peer advertised when the link
+/// ended; a different digest lifts the bar at once. Bounded by
+/// `max_peers`: when full, the entry that ends soonest makes room.
+#[derive(Debug)]
+pub(crate) struct Cooldowns {
+    entries: HashMap<[u8; 8], (Duration, [u8; 4])>,
+    max: usize,
+    duration: Duration,
+}
+
+impl Cooldowns {
+    pub(crate) fn new(config: &NetworkConfig) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max: usize::try_from(config.max_peers()).unwrap_or(usize::MAX),
+            duration: COOLDOWN,
+        }
+    }
+
+    /// Bars `hint` from `now` while it keeps advertising `digest`.
+    pub(crate) fn start(&mut self, now: Duration, hint: [u8; 8], digest: [u8; 4]) {
+        self.entries.retain(|_, (until, _)| now < *until);
+        if !self.entries.contains_key(&hint) && self.entries.len() >= self.max {
+            let soonest = self
+                .entries
+                .iter()
+                .min_by_key(|(key, (until, _))| (*until, **key))
+                .map(|(&key, _)| key);
+            if let Some(key) = soonest {
+                self.entries.remove(&key);
+            }
+        }
+        let until = now.checked_add(self.duration).unwrap_or(Duration::MAX);
+        self.entries.insert(hint, (until, digest));
+    }
+
+    /// Whether a peer advertising `beacon` is barred at `now`.
+    pub(crate) fn bars(&self, now: Duration, beacon: &Beacon) -> bool {
+        self.entries
+            .get(&beacon.hint)
+            .is_some_and(|(until, digest)| now < *until && *digest == beacon.digest)
+    }
+
+    /// The number of barred hints; tests only.
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -707,7 +794,93 @@ mod tests {
             total,
             stable,
             explore,
+            opportunistic: 0,
         }
+    }
+
+    /// The opportunistic slot opens once the stable target is reached,
+    /// holds one link, and never takes the total past the cap.
+    #[test]
+    fn the_opportunistic_slot_opens_at_the_stable_target() {
+        let policy = TopologyPolicy::new(&NetworkConfig::default());
+        assert!(
+            !policy.admit_opportunistic(&counts(2, 2, 0)),
+            "below target"
+        );
+        assert!(policy.admit_opportunistic(&counts(3, 3, 0)));
+        assert!(policy.admit_opportunistic(&counts(4, 3, 1)));
+        let mut held = counts(4, 3, 0);
+        held.opportunistic = 1;
+        assert!(!policy.admit_opportunistic(&held), "the slot is taken");
+        assert!(!policy.admit_opportunistic(&counts(5, 4, 1)), "at the cap");
+        // Too small a cap has no opportunistic slot at all.
+        let two = TopologyPolicy::new(&NetworkConfig::default().with_max_links(2).unwrap());
+        assert!(!two.admit_opportunistic(&counts(1, 2, 0)));
+    }
+
+    fn beacon(hint: u8, digest: u8) -> Beacon {
+        Beacon {
+            flags: BeaconFlags::default(),
+            degree: 0,
+            max_links: 5,
+            hint: [hint; 8],
+            digest: [digest; 4],
+        }
+    }
+
+    /// A digest is new on the first decoded sighting and on every change,
+    /// stays new across sightings until a link comes up, and an unchanged
+    /// digest after that is not new.
+    #[test]
+    fn a_digest_stays_new_until_a_link_comes_up() {
+        let mut table = table();
+        let with_digest = |digest: u8| {
+            let mut b = beacon(7, digest);
+            b.flags.accepting = true;
+            b.encode().to_vec()
+        };
+        table.observe(Duration::ZERO, PEER, -60, &[0xFF; 4]);
+        assert!(!table.unsynced(&PEER), "nothing decoded yet");
+        table.observe(Duration::ZERO, PEER, -60, &with_digest(1));
+        assert!(table.unsynced(&PEER), "first decoded sighting");
+        table.observe(Duration::ZERO, PEER, -60, &with_digest(1));
+        assert!(table.unsynced(&PEER), "still new until linked");
+        table.mark_connecting(&PEER);
+        table.mark_linked(&PEER);
+        assert!(!table.unsynced(&PEER));
+        table.observe(Duration::ZERO, PEER, -60, &with_digest(1));
+        assert!(!table.unsynced(&PEER), "unchanged");
+        table.observe(Duration::ZERO, PEER, -60, &with_digest(2));
+        assert!(table.unsynced(&PEER), "changed");
+        assert!(!table.unsynced(&OTHER), "unknown peer");
+    }
+
+    /// A cooldown bars its hint for its duration, a new digest lifts it,
+    /// and the table stays bounded.
+    #[test]
+    fn a_cooldown_bars_a_hint_until_it_lapses_or_the_digest_changes() {
+        let mut cooldowns = Cooldowns::new(&NetworkConfig::default());
+        cooldowns.start(Duration::ZERO, [1; 8], [9; 4]);
+        assert!(cooldowns.bars(Duration::from_secs(59), &beacon(1, 9)));
+        assert!(
+            !cooldowns.bars(Duration::from_secs(59), &beacon(1, 8)),
+            "new digest"
+        );
+        assert!(
+            !cooldowns.bars(Duration::from_secs(59), &beacon(2, 9)),
+            "other hint"
+        );
+        assert!(!cooldowns.bars(COOLDOWN, &beacon(1, 9)), "lapsed");
+
+        let config = NetworkConfig::default().with_max_peers(3).unwrap();
+        let mut cooldowns = Cooldowns::new(&config);
+        for hint in 0..10u8 {
+            cooldowns.start(Duration::from_secs(u64::from(hint)), [hint; 8], [0; 4]);
+            assert!(cooldowns.tracked() <= 3);
+        }
+        // The newest survive; the oldest made room.
+        assert!(cooldowns.bars(Duration::from_secs(9), &beacon(9, 0)));
+        assert!(!cooldowns.bars(Duration::from_secs(9), &beacon(0, 0)));
     }
 
     /// Done when: the default configuration produces the slots the
