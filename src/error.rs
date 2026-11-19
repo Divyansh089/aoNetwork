@@ -5,7 +5,7 @@
 //! `#[non_exhaustive]` so later issues (codec, transport, topology) can add
 //! variants without breaking downstream matches.
 
-use crate::Channel;
+use crate::{Channel, RateLimit};
 
 /// A configuration value failed validation.
 ///
@@ -109,6 +109,43 @@ pub enum ConfigError {
         /// The current `queue_cap`.
         queue_cap: usize,
     },
+
+    /// `frame_limit` has a rate outside `1..=max` or a burst outside
+    /// `min_burst..=max`.
+    #[error(
+        "frame_limit needs a rate in 1..={max} and a burst in {min_burst}..={max}, got {limit:?}"
+    )]
+    FrameLimitOutOfRange {
+        /// The rejected limit.
+        limit: RateLimit,
+        /// Smallest allowed burst.
+        min_burst: u32,
+        /// Largest allowed rate and burst.
+        max: u32,
+    },
+
+    /// `byte_limit` has a rate outside `1..=max` or a burst outside
+    /// `min_burst..=max`.
+    #[error(
+        "byte_limit needs a rate in 1..={max} and a burst in {min_burst}..={max}, got {limit:?}"
+    )]
+    ByteLimitOutOfRange {
+        /// The rejected limit.
+        limit: RateLimit,
+        /// Smallest allowed burst: one chunk at the largest MTU.
+        min_burst: u32,
+        /// Largest allowed rate and burst.
+        max: u32,
+    },
+
+    /// `max_strikes` is zero, so a peer would be blacklisted before any
+    /// strike.
+    #[error("max_strikes must be at least 1")]
+    MaxStrikesZero,
+
+    /// `blacklist_duration` is zero, so a blacklist entry would end at once.
+    #[error("blacklist_duration must be greater than zero")]
+    BlacklistDurationZero,
 }
 
 /// A beacon payload failed structural validation.
@@ -363,7 +400,8 @@ pub enum DisconnectReason {
     KeepaliveTimeout,
     /// Malformed or unexpected traffic from the peer.
     ProtocolViolation,
-    /// The abuse guard struck or blacklisted the peer.
+    /// The peer sent faster than the link's frame or byte limit, or is
+    /// blacklisted.
     AbuseDetected,
     /// Evicted to stay within the degree cap.
     DegreeCap,

@@ -53,6 +53,7 @@
 mod codec;
 mod config;
 mod error;
+mod guard;
 mod link;
 mod metrics;
 #[cfg(feature = "native")]
@@ -74,6 +75,7 @@ pub use error::{
     BeaconError, ConfigError, ConnectError, DisconnectReason, FragmentError, FrameError,
     HandshakeFailure, NetError, SendError,
 };
+pub use guard::RateLimit;
 pub use link::{Link, LinkAction, LinkEnd, LinkState};
 pub use metrics::LinkMetrics;
 #[cfg(feature = "native")]

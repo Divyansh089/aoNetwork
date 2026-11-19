@@ -7,8 +7,8 @@
 
 use std::time::Duration;
 
-use crate::Channel;
 use crate::error::ConfigError;
+use crate::{Channel, MAX_MTU, RateLimit};
 
 // Hard bounds. These catch unit errors and bound memory; they are not policy
 // (policy is the app's choice within these limits).
@@ -21,6 +21,11 @@ const MAX_RSSI: i16 = 0;
 const MIN_FRAME: usize = 64;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_QUEUE_CAP: usize = 1024 * 1024;
+// Both parts of a rate limit; the bucket arithmetic stays far from overflow.
+const MAX_RATE: u32 = 16 * 1024 * 1024;
+const MIN_FRAME_BURST: u32 = 1;
+// A full chunk at the largest MTU always fits in the byte bucket.
+const MIN_BYTE_BURST: u32 = MAX_MTU as u32;
 
 // Defaults. Documented in the README and asserted verbatim by the tests.
 const DEFAULT_MAX_LINKS: u32 = 5;
@@ -35,6 +40,16 @@ const DEFAULT_QUEUE_CAP: usize = 128 * 1024;
 // Control, Message, Telemetry, Bulk. Each holds one default-size frame and
 // together they fill `DEFAULT_QUEUE_CAP`.
 const DEFAULT_CHANNEL_CAPS: [usize; 4] = [16 * 1024, 48 * 1024, 16 * 1024, 48 * 1024];
+const DEFAULT_FRAME_LIMIT: RateLimit = RateLimit {
+    per_second: 50,
+    burst: 200,
+};
+const DEFAULT_BYTE_LIMIT: RateLimit = RateLimit {
+    per_second: 64 * 1024,
+    burst: 256 * 1024,
+};
+const DEFAULT_MAX_STRIKES: u8 = 3;
+const DEFAULT_BLACKLIST_DURATION: Duration = Duration::from_secs(10 * 60);
 
 /// Link-layer configuration with validated defaults.
 ///
@@ -50,6 +65,10 @@ const DEFAULT_CHANNEL_CAPS: [usize; 4] = [16 * 1024, 48 * 1024, 16 * 1024, 48 * 
 /// | `max_frame` | 16 KiB | 64 B..=1 MiB |
 /// | `queue_cap` | 128 KiB per link | `max_frame`..=1 MiB |
 /// | `channel_cap` | Control 16, Message 48, Telemetry 16, Bulk 48 KiB | each >= 64 B, sum <= `queue_cap` |
+/// | `frame_limit` | 50 frames/s, burst 200 per link | rate 1..=16 Mi, burst 1..=16 Mi |
+/// | `byte_limit` | 64 KiB/s, burst 256 KiB per link | rate 1..=16 Mi, burst 517 B..=16 MiB |
+/// | `max_strikes` | 3 | >= 1 |
+/// | `blacklist_duration` | 10 min | > 0 |
 ///
 /// Start from [`Default`] and chain the setters; each returns
 /// `Result<Self, ConfigError>` and validates the **whole** configuration, so
@@ -86,6 +105,10 @@ pub struct NetworkConfig {
     max_frame: usize,
     queue_cap: usize,
     channel_caps: [usize; 4],
+    frame_limit: RateLimit,
+    byte_limit: RateLimit,
+    max_strikes: u8,
+    blacklist_duration: Duration,
 }
 
 impl NetworkConfig {
@@ -164,6 +187,26 @@ impl NetworkConfig {
                 total,
                 queue_cap: self.queue_cap,
             });
+        }
+        if !rate_ok(self.frame_limit, MIN_FRAME_BURST) {
+            return Err(ConfigError::FrameLimitOutOfRange {
+                limit: self.frame_limit,
+                min_burst: MIN_FRAME_BURST,
+                max: MAX_RATE,
+            });
+        }
+        if !rate_ok(self.byte_limit, MIN_BYTE_BURST) {
+            return Err(ConfigError::ByteLimitOutOfRange {
+                limit: self.byte_limit,
+                min_burst: MIN_BYTE_BURST,
+                max: MAX_RATE,
+            });
+        }
+        if self.max_strikes == 0 {
+            return Err(ConfigError::MaxStrikesZero);
+        }
+        if self.blacklist_duration.is_zero() {
+            return Err(ConfigError::BlacklistDurationZero);
         }
         Ok(())
     }
@@ -287,6 +330,54 @@ impl NetworkConfig {
         Ok(self)
     }
 
+    /// Sets how many frames a peer may send on one link (default: 50 per
+    /// second, burst 200).
+    ///
+    /// Both parts must be in `1..=16 Mi`. A peer that sends faster is
+    /// disconnected with
+    /// [`DisconnectReason::AbuseDetected`](crate::DisconnectReason::AbuseDetected)
+    /// and blacklisted. Every frame counts, `Ping` included.
+    pub fn with_frame_limit(mut self, limit: RateLimit) -> Result<Self, ConfigError> {
+        self.frame_limit = limit;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Sets how many bytes a peer may send on one link (default: 64 KiB
+    /// per second, burst 256 KiB), counted as received chunks.
+    ///
+    /// The rate must be in `1..=16 Mi` and the burst in `517 B..=16 MiB`,
+    /// so one chunk at the largest MTU always fits. A peer that sends
+    /// faster is treated as for [`with_frame_limit`](Self::with_frame_limit).
+    pub fn with_byte_limit(mut self, limit: RateLimit) -> Result<Self, ConfigError> {
+        self.byte_limit = limit;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Sets how many strikes blacklist a peer (default: 3).
+    ///
+    /// A strike is a link closed for a malformed frame, a broken chunk
+    /// stream or an oversize `Hello`. Must be at least 1.
+    pub fn with_max_strikes(mut self, max_strikes: u8) -> Result<Self, ConfigError> {
+        self.max_strikes = max_strikes;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Sets how long a blacklisted peer stays blocked, and how long a
+    /// strike is remembered after the last one (default: 10 min).
+    ///
+    /// Must be greater than zero.
+    pub fn with_blacklist_duration(
+        mut self,
+        blacklist_duration: Duration,
+    ) -> Result<Self, ConfigError> {
+        self.blacklist_duration = blacklist_duration;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// The degree cap: how many links this node keeps at once.
     pub fn max_links(&self) -> u32 {
         self.max_links
@@ -338,6 +429,33 @@ impl NetworkConfig {
     pub fn channel_cap(&self, channel: Channel) -> usize {
         self.channel_caps[channel.index()]
     }
+
+    /// How many frames a peer may send on one link.
+    pub fn frame_limit(&self) -> RateLimit {
+        self.frame_limit
+    }
+
+    /// How many bytes a peer may send on one link.
+    pub fn byte_limit(&self) -> RateLimit {
+        self.byte_limit
+    }
+
+    /// How many strikes blacklist a peer.
+    pub fn max_strikes(&self) -> u8 {
+        self.max_strikes
+    }
+
+    /// How long a blacklisted peer stays blocked and a strike is
+    /// remembered.
+    pub fn blacklist_duration(&self) -> Duration {
+        self.blacklist_duration
+    }
+}
+
+/// Whether `limit` has a rate in `1..=MAX_RATE` and a burst in
+/// `min_burst..=MAX_RATE`.
+fn rate_ok(limit: RateLimit, min_burst: u32) -> bool {
+    (1..=MAX_RATE).contains(&limit.per_second) && (min_burst..=MAX_RATE).contains(&limit.burst)
 }
 
 impl Default for NetworkConfig {
@@ -355,6 +473,10 @@ impl Default for NetworkConfig {
             max_frame: DEFAULT_MAX_FRAME,
             queue_cap: DEFAULT_QUEUE_CAP,
             channel_caps: DEFAULT_CHANNEL_CAPS,
+            frame_limit: DEFAULT_FRAME_LIMIT,
+            byte_limit: DEFAULT_BYTE_LIMIT,
+            max_strikes: DEFAULT_MAX_STRIKES,
+            blacklist_duration: DEFAULT_BLACKLIST_DURATION,
         }
     }
 }
@@ -380,6 +502,81 @@ mod tests {
         assert_eq!(cfg.channel_cap(Channel::Message), 48 * 1024);
         assert_eq!(cfg.channel_cap(Channel::Telemetry), 16 * 1024);
         assert_eq!(cfg.channel_cap(Channel::Bulk), 48 * 1024);
+        let frames = RateLimit {
+            per_second: 50,
+            burst: 200,
+        };
+        assert_eq!(cfg.frame_limit(), frames);
+        let bytes = RateLimit {
+            per_second: 64 * 1024,
+            burst: 256 * 1024,
+        };
+        assert_eq!(cfg.byte_limit(), bytes);
+        assert_eq!(cfg.max_strikes(), 3);
+        assert_eq!(cfg.blacklist_duration(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn rate_limit_bounds_are_enforced() {
+        let base = NetworkConfig::default();
+        let limit = |per_second, burst| RateLimit { per_second, burst };
+        let max = 16 * 1024 * 1024;
+        for bad in [
+            limit(0, 10),
+            limit(10, 0),
+            limit(max + 1, 10),
+            limit(10, max + 1),
+        ] {
+            assert_eq!(
+                base.clone().with_frame_limit(bad).unwrap_err(),
+                ConfigError::FrameLimitOutOfRange {
+                    limit: bad,
+                    min_burst: 1,
+                    max
+                }
+            );
+        }
+        for good in [limit(1, 1), limit(max, max)] {
+            assert_eq!(
+                base.clone().with_frame_limit(good).unwrap().frame_limit(),
+                good
+            );
+        }
+        for bad in [limit(0, 1024), limit(1024, 516), limit(1024, max + 1)] {
+            assert_eq!(
+                base.clone().with_byte_limit(bad).unwrap_err(),
+                ConfigError::ByteLimitOutOfRange {
+                    limit: bad,
+                    min_burst: 517,
+                    max
+                }
+            );
+        }
+        let good = limit(1, 517);
+        assert_eq!(base.with_byte_limit(good).unwrap().byte_limit(), good);
+    }
+
+    #[test]
+    fn strikes_and_blacklist_duration_must_be_positive() {
+        let base = NetworkConfig::default();
+        assert_eq!(
+            base.clone().with_max_strikes(0).unwrap_err(),
+            ConfigError::MaxStrikesZero
+        );
+        assert_eq!(base.clone().with_max_strikes(1).unwrap().max_strikes(), 1);
+        assert_eq!(
+            base.clone()
+                .with_blacklist_duration(Duration::ZERO)
+                .unwrap_err(),
+            ConfigError::BlacklistDurationZero
+        );
+        let one = Duration::from_nanos(1);
+        assert_eq!(
+            base.with_blacklist_duration(one)
+                .unwrap()
+                .blacklist_duration(),
+            one
+        );
     }
 
     #[test]
