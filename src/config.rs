@@ -50,6 +50,7 @@ const DEFAULT_BYTE_LIMIT: RateLimit = RateLimit {
 };
 const DEFAULT_MAX_STRIKES: u8 = 3;
 const DEFAULT_BLACKLIST_DURATION: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Link-layer configuration with validated defaults.
 ///
@@ -69,6 +70,7 @@ const DEFAULT_BLACKLIST_DURATION: Duration = Duration::from_secs(10 * 60);
 /// | `byte_limit` | 64 KiB/s, burst 256 KiB per link | rate 1..=16 Mi, burst 517 B..=16 MiB |
 /// | `max_strikes` | 3 | >= 1 |
 /// | `blacklist_duration` | 10 min | > 0 |
+/// | `discovery_interval` | 10 s | > 0 |
 ///
 /// Start from [`Default`] and chain the setters; each returns
 /// `Result<Self, ConfigError>` and validates the **whole** configuration, so
@@ -109,6 +111,7 @@ pub struct NetworkConfig {
     byte_limit: RateLimit,
     max_strikes: u8,
     blacklist_duration: Duration,
+    discovery_interval: Duration,
 }
 
 impl NetworkConfig {
@@ -207,6 +210,9 @@ impl NetworkConfig {
         }
         if self.blacklist_duration.is_zero() {
             return Err(ConfigError::BlacklistDurationZero);
+        }
+        if self.discovery_interval.is_zero() {
+            return Err(ConfigError::DiscoveryIntervalZero);
         }
         Ok(())
     }
@@ -378,6 +384,22 @@ impl NetworkConfig {
         Ok(self)
     }
 
+    /// Sets the shortest time between two discovery profile requests
+    /// (default: 10 s).
+    ///
+    /// No scan or advertise mode change, and no start or stop of a quiet
+    /// scan window, is requested sooner than this after the last. Android
+    /// throttles apps that start scans more than five times in 30 s, which
+    /// the default keeps well clear of. Must be greater than zero.
+    pub fn with_discovery_interval(
+        mut self,
+        discovery_interval: Duration,
+    ) -> Result<Self, ConfigError> {
+        self.discovery_interval = discovery_interval;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// The degree cap: how many links this node keeps at once.
     pub fn max_links(&self) -> u32 {
         self.max_links
@@ -450,6 +472,11 @@ impl NetworkConfig {
     pub fn blacklist_duration(&self) -> Duration {
         self.blacklist_duration
     }
+
+    /// The shortest time between two discovery profile requests.
+    pub fn discovery_interval(&self) -> Duration {
+        self.discovery_interval
+    }
 }
 
 /// Whether `limit` has a rate in `1..=MAX_RATE` and a burst in
@@ -477,6 +504,7 @@ impl Default for NetworkConfig {
             byte_limit: DEFAULT_BYTE_LIMIT,
             max_strikes: DEFAULT_MAX_STRIKES,
             blacklist_duration: DEFAULT_BLACKLIST_DURATION,
+            discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
         }
     }
 }
@@ -514,6 +542,7 @@ mod tests {
         assert_eq!(cfg.byte_limit(), bytes);
         assert_eq!(cfg.max_strikes(), 3);
         assert_eq!(cfg.blacklist_duration(), Duration::from_secs(600));
+        assert_eq!(cfg.discovery_interval(), Duration::from_secs(10));
     }
 
     #[test]
@@ -575,6 +604,24 @@ mod tests {
             base.with_blacklist_duration(one)
                 .unwrap()
                 .blacklist_duration(),
+            one
+        );
+    }
+
+    #[test]
+    fn discovery_interval_must_be_positive() {
+        let base = NetworkConfig::default();
+        assert_eq!(
+            base.clone()
+                .with_discovery_interval(Duration::ZERO)
+                .unwrap_err(),
+            ConfigError::DiscoveryIntervalZero
+        );
+        let one = Duration::from_nanos(1);
+        assert_eq!(
+            base.with_discovery_interval(one)
+                .unwrap()
+                .discovery_interval(),
             one
         );
     }

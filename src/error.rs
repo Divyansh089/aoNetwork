@@ -146,6 +146,10 @@ pub enum ConfigError {
     /// `blacklist_duration` is zero, so a blacklist entry would end at once.
     #[error("blacklist_duration must be greater than zero")]
     BlacklistDurationZero,
+    /// `discovery_interval` is zero, so profile changes would not be
+    /// rate-limited at all.
+    #[error("discovery_interval must be greater than zero")]
+    DiscoveryIntervalZero,
 }
 
 /// A beacon payload failed structural validation.

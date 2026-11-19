@@ -2,7 +2,7 @@
 
 **The link layer of the aoheyra mesh.** A sans-IO Rust crate that turns a raw Bluetooth LE radio (or an in-memory simulator) into reliable, prioritised, abuse-resistant links between neighbouring phones.
 
-> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection) and NET-21 (send-queue coalescing and expiry) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
+> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection), NET-19 (discovery modes) and NET-21 (send-queue coalescing and expiry) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
 
 Cargo package name: `ao_network` (the repo name keeps its capitals; the package is snake_case).
 
@@ -27,6 +27,7 @@ aoNetwork knows about **radio peers and frames**. It does not know what a messag
 ## What it does
 
 - Discovers neighbours through BLE advertising and scan-response **beacons** and decides who to connect to, through a bounded **peer table** that evicts the unseen after 30 s and backs off after a failed attempt.
+- Picks a **discovery mode** from its degree and battery: aggressive (low-latency scanning and advertising) below the stable target, normal (balanced) at it, and quiet (low power, scanning in 10 s windows with 50 s pauses) while the beacon says the battery is low or the app says the node is idle. A mode change is requested at most once per `discovery_interval` (10 s), well inside Android's limit on scan starts.
 - Runs a **link state machine** (`Connecting → Negotiating → Handshaking → Ready → Closing → Closed`) with an unauthenticated `Hello` exchange.
 - **Fragments and reassembles** frames over the BLE MTU (23 to 517).
 - Schedules traffic through a **four-channel send queue** with per-link byte caps, coalescing and expiry.
@@ -119,6 +120,7 @@ and scanning are separate work.
 | Send-queue cap | 128 KiB per link, split Control 16, Message 48, Telemetry 16, Bulk 48 KiB |
 | Inbound rate limit | 50 frames/s (burst 200) and 64 KiB/s (burst 256 KiB) per link |
 | Strikes | 3 strikes blacklist a peer; blacklist and strike memory last 10 min |
+| `discovery_interval` | 10 s between scan or advertise mode changes |
 
 These may change after the BLE spike (AND-02). Source of truth is `NetworkConfig`, not this table.
 

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Discovery mode controller (NET-19): `Network` picks a `DiscoveryMode`
+  from its degree and battery and scans and advertises accordingly -
+  `Aggressive` (low latency) below the stable target, `Normal`
+  (balanced) at it, and `Quiet` (low power, scanning in windows of one
+  interval with pauses of five) while the beacon's `low_battery` flag
+  is set or the new `Network::set_idle` says so. A mode change, or the
+  start or stop of a quiet scan window, is requested no sooner than the
+  new `discovery_interval` config (default 10 s) after the last one;
+  beacon content updates are not held back. `Network::discovery_mode`
+  reads the mode in force.
 - Inbound abuse protection (NET-18): each link meters what its peer
   sends with token buckets for frames and bytes (`frame_limit`, default
   50/s with a burst of 200, and `byte_limit`, default 64 KiB/s with a
