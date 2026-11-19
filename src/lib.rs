@@ -52,6 +52,7 @@
 
 mod codec;
 mod config;
+mod discovery;
 mod error;
 mod guard;
 mod link;
@@ -71,6 +72,7 @@ pub use codec::{
     Hello, MAX_APP_HELLO, MAX_MTU, MIN_MTU, Reassembler,
 };
 pub use config::NetworkConfig;
+pub use discovery::DiscoveryMode;
 pub use error::{
     BeaconError, ConfigError, ConnectError, DisconnectReason, FragmentError, FrameError,
     HandshakeFailure, NetError, SendError,

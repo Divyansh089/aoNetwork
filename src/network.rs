@@ -16,6 +16,7 @@
 //! | [`broadcast`](Network::broadcast) | `send` to every up link |
 //! | [`disconnect`](Network::disconnect) | `LinkDown` after an up link closes; no event for a cancelled connection attempt |
 //! | [`links`](Network::links) | none; lists the up links |
+//! | [`set_idle`](Network::set_idle) | none; switches discovery to [`DiscoveryMode::Quiet`] from the next poll |
 //!
 //! `LinkUp` comes once per link, after a successful handshake, and
 //! `LinkDown` once after it, when that link ends. Links that never come up
@@ -27,14 +28,15 @@ use std::future::{Future, poll_fn};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::discovery::{DiscoveryController, Inputs};
 use crate::guard::AbuseGuard;
 use crate::topology::{
     ClassCounts, LinkClass, PeerTable, ReadyLink, TopologyPolicy, duplicate_loser,
 };
 use crate::{
     AdvProfile, AppHello, Beacon, BeaconFlags, Channel, ConnectError, DisconnectReason,
-    FRAME_VERSION, HandshakeFailure, Hello, Link, LinkAction, LinkEnd, LinkId, LinkMetrics,
-    LinkRole, LinkState, LocalTag, NetworkConfig, PeerKey, PowerMode, RadioState, ScanProfile,
+    DiscoveryMode, FRAME_VERSION, HandshakeFailure, Hello, Link, LinkAction, LinkEnd, LinkId,
+    LinkMetrics, LinkRole, LinkState, LocalTag, NetworkConfig, PeerKey, RadioState, ScanProfile,
     SendError, SendOpts, Transport, TransportEvent,
 };
 
@@ -141,6 +143,15 @@ struct Entry {
 /// links are refused, and any link still open to it is closed, until
 /// `blacklist_duration` has passed.
 ///
+/// How hard it scans and advertises follows its [`DiscoveryMode`]:
+/// aggressive while it holds fewer up links than its stable target,
+/// normal at the target, and quiet while the beacon's `low_battery` flag
+/// is set or [`set_idle`](Self::set_idle) says so. A mode change is
+/// requested from the radio no sooner than `discovery_interval` after
+/// the last request, and quiet scanning runs in windows of one interval
+/// with pauses of five, so the radio never restarts its scanner faster
+/// than Android allows. Beacon content changes are not held back.
+///
 /// # Example
 ///
 /// ```
@@ -185,10 +196,10 @@ pub struct Network<T> {
     transport: T,
     hello: Option<Hello>,
     beacon: Option<LocalBeacon>,
-    /// Whether the transport is scanning, to skip repeats.
-    scanning: bool,
-    /// The beacon last handed to the transport, to skip repeats.
-    advertised: Option<[u8; 16]>,
+    /// The scan profile last handed to the transport, to skip repeats.
+    scan: Option<Option<ScanProfile>>,
+    /// The advertisement last handed to the transport, to skip repeats.
+    advertised: Option<AdvProfile>,
     links: BTreeMap<LinkId, Entry>,
     /// Every link, in any state, by peer.
     peers: BTreeMap<PeerKey, LinkId>,
@@ -198,6 +209,10 @@ pub struct Network<T> {
     policy: TopologyPolicy,
     /// Strikes and the blacklist.
     guard: AbuseGuard,
+    /// The discovery mode and the profiles it asks for.
+    discovery: DiscoveryController,
+    /// The caller says the node is idle.
+    idle: bool,
     events: VecDeque<NetworkEvent>,
 }
 
@@ -208,18 +223,27 @@ impl<T: Transport> Network<T> {
         let table = PeerTable::new(&config);
         let policy = TopologyPolicy::new(&config);
         let guard = AbuseGuard::new(&config);
+        let inputs = Inputs {
+            degree: 0,
+            target: discovery_target(&policy),
+            low_battery: false,
+            idle: false,
+        };
+        let discovery = DiscoveryController::new(&config, &inputs);
         Self {
             config,
             transport,
             hello: None,
             beacon: None,
-            scanning: false,
+            scan: None,
             advertised: None,
             links: BTreeMap::new(),
             peers: BTreeMap::new(),
             table,
             policy,
             guard,
+            discovery,
+            idle: false,
             events: VecDeque::new(),
         }
     }
@@ -242,19 +266,32 @@ impl<T: Transport> Network<T> {
             tag,
             app_hello,
         });
-        self.apply_profiles();
+        self.apply_profiles(None);
     }
 
     /// Sets the beacon fields the layer above owns. The node fills in its
     /// degree and `max_links`, and advertises `accepting` only while it has
-    /// room for another link.
+    /// room for another link. `flags.low_battery` also puts discovery in
+    /// [`DiscoveryMode::Quiet`] from the next poll.
     pub fn set_beacon(&mut self, hint: [u8; 8], digest: [u8; 4], flags: BeaconFlags) {
         self.beacon = Some(LocalBeacon {
             hint,
             digest,
             flags,
         });
-        self.apply_profiles();
+        self.apply_profiles(None);
+    }
+
+    /// Says whether the node is idle, as the app judges it (in the
+    /// background, say). While idle, discovery is
+    /// [`DiscoveryMode::Quiet`] from the next poll.
+    pub fn set_idle(&mut self, idle: bool) {
+        self.idle = idle;
+    }
+
+    /// The discovery mode in force.
+    pub fn discovery_mode(&self) -> DiscoveryMode {
+        self.discovery.mode()
     }
 
     /// Queues `payload` on `channel` of an up `link`, as of `now`.
@@ -358,6 +395,7 @@ impl<T: Transport> Network<T> {
         self.links
             .values()
             .filter_map(|entry| entry.machine.next_deadline())
+            .chain(self.discovery.next_deadline(&self.discovery_inputs()))
             .min()
     }
 
@@ -390,9 +428,9 @@ impl<T: Transport> Network<T> {
         let link = match &event {
             TransportEvent::RadioState(RadioState::Ready) => {
                 // A restarted radio has forgotten its profiles.
-                self.scanning = false;
+                self.scan = None;
                 self.advertised = None;
-                self.apply_profiles();
+                self.apply_profiles(Some(now));
                 return;
             }
             TransportEvent::Discovered { peer, rssi, beacon } => {
@@ -552,7 +590,7 @@ impl<T: Transport> Network<T> {
         );
         self.peers.insert(peer, link);
         self.table.mark_connecting(&peer);
-        self.apply_profiles();
+        self.apply_profiles(Some(now));
     }
 
     fn tick(&mut self, now: Duration) {
@@ -567,6 +605,20 @@ impl<T: Transport> Network<T> {
                 let actions = entry.machine.on_tick(now);
                 self.apply(now, link, actions);
             }
+        }
+        let inputs = self.discovery_inputs();
+        if self.discovery.poll(now, &inputs) {
+            self.apply_profiles(Some(now));
+        }
+    }
+
+    /// What the discovery mode is decided from, as things stand.
+    fn discovery_inputs(&self) -> Inputs {
+        Inputs {
+            degree: self.links.values().filter(|entry| entry.up).count(),
+            target: discovery_target(&self.policy),
+            low_battery: self.beacon.is_some_and(|own| own.flags.low_battery),
+            idle: self.idle,
         }
     }
 
@@ -648,7 +700,7 @@ impl<T: Transport> Network<T> {
         if let LinkEnd::Disconnected(reason) = end {
             self.judge(now, entry.peer, reason);
         }
-        self.apply_profiles();
+        self.apply_profiles(Some(now));
         // A slot just freed: dial the next candidate now rather than
         // waiting for a sighting to say the neighbourhood changed.
         for peer in self.table.candidates(now, &self.peers) {
@@ -754,21 +806,45 @@ impl<T: Transport> Network<T> {
         }
     }
 
-    /// Scans once a `Hello` is set; advertises once a beacon is set too.
-    fn apply_profiles(&mut self) {
+    /// Scans once a `Hello` is set, and advertises once a beacon is set
+    /// too, with the profiles of the discovery mode in force. A request
+    /// that starts, stops or changes the mode of either is reported to
+    /// the controller as made at `now`, or at the next poll when the
+    /// command had no time; a new beacon on its own is not.
+    fn apply_profiles(&mut self, now: Option<Duration>) {
         if self.hello.is_none() {
             return;
         }
-        let mode = PowerMode::Balanced;
-        if !self.scanning {
-            self.scanning = true;
-            self.transport.set_scanning(Some(ScanProfile { mode }));
+        let profiles = self.discovery.profiles();
+        let mut requested = false;
+        let scan = profiles.scan.map(|mode| ScanProfile { mode });
+        if self.scan != Some(scan) {
+            self.scan = Some(scan);
+            self.transport.set_scanning(scan);
+            requested = true;
         }
-        let Some(own) = self.beacon else {
-            return;
-        };
+        if let Some(beacon) = self.local_beacon() {
+            let advert = AdvProfile {
+                beacon,
+                mode: profiles.advertise,
+            };
+            if self.advertised != Some(advert) {
+                requested |= self.advertised.map(|old| old.mode) != Some(advert.mode);
+                self.advertised = Some(advert);
+                self.transport.set_advertising(Some(advert));
+            }
+        }
+        if requested {
+            self.discovery.requested(now);
+        }
+    }
+
+    /// The beacon to advertise, once the caller has set its fields and
+    /// if the radio can advertise at all.
+    fn local_beacon(&self) -> Option<[u8; 16]> {
+        let own = self.beacon?;
         if !self.transport.caps().can_advertise {
-            return;
+            return None;
         }
         let beacon = Beacon {
             flags: BeaconFlags {
@@ -780,14 +856,15 @@ impl<T: Transport> Network<T> {
             max_links: u8::try_from(self.config.max_links()).unwrap_or(u8::MAX),
             hint: own.hint,
             digest: own.digest,
-        }
-        .encode();
-        if self.advertised != Some(beacon) {
-            self.advertised = Some(beacon);
-            self.transport
-                .set_advertising(Some(AdvProfile { beacon, mode }));
-        }
+        };
+        Some(beacon.encode())
     }
+}
+
+/// The degree below which discovery is aggressive: the stable target, or
+/// the session's lowered cap if that is smaller.
+fn discovery_target(policy: &TopologyPolicy) -> usize {
+    policy.target_stable.min(policy.effective_cap)
 }
 
 #[cfg(all(test, feature = "sim"))]
