@@ -18,12 +18,23 @@ publish = false
 # actively maintained, MSRV well below ours. Hand-rolling Display for the
 # many error variants this crate will grow (NET-04..18) is pure boilerplate.
 thiserror = "2"
+# Per-link spans and lifecycle events (NET-23). The standard Rust
+# instrumentation API, MIT; it reads no clock and spawns nothing, and costs
+# a branch per call site when no subscriber is installed.
+tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+# `Serialize` for Network::snapshot, behind the `serde` feature (NET-23).
+# Never used for the wire format.
+serde = { version = "1.0.219", default-features = false, features = ["std", "derive"], optional = true }
 
 [dev-dependencies]
 proptest = { version = "1.8", default-features = false, features = ["std"] }
 # Hot-path benches (README, Development). Criterion is the standard
 # measurement harness; dev-dependency only, never part of the library.
 criterion = "0.7.0"
+# Captures the tracing output of a simulator run as text (NET-23 tests).
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["fmt", "std"] }
+# Checks that a snapshot serializes (NET-23 tests).
+serde_json = "1.0.140"
 
 # Hot-path benches (README, Development).
 [[bench]]
@@ -36,6 +47,8 @@ default = ["sim"]
 sim = []
 # NativeTransport adapter for the Kotlin BLE shim (NET-14). No UniFFI here.
 native = []
+# `Serialize` on Network::snapshot and the types in it (NET-23).
+serde = ["dep:serde"]
 
 [[example]]
 name = "sim_chat"

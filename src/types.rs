@@ -26,6 +26,7 @@
 /// assert_eq!(a.raw(), 1);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct LinkId(u64);
 
 impl LinkId {
@@ -62,6 +63,14 @@ impl LinkId {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PeerKey([u8; 16]);
+
+/// Serialized as 32 lowercase hex digits, as it appears in logs.
+#[cfg(feature = "serde")]
+impl serde::Serialize for PeerKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&crate::observe::Hex(&self.0))
+    }
+}
 
 impl PeerKey {
     /// Creates a key from 16 opaque bytes.
@@ -121,6 +130,7 @@ impl From<[u8; 16]> for LocalTag {
 /// Decides who sends `Hello` first and how the handshake state machine
 /// (NET-10) is parameterised. The set is closed: BLE has exactly two roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum LinkRole {
     /// Opened the connection (BLE central side).
     Initiator,

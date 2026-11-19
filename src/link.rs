@@ -19,6 +19,7 @@ use crate::{
 
 /// Where a link is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum LinkState {
     /// Outbound link waiting for the transport to connect.
     Connecting,
@@ -146,7 +147,18 @@ impl Link {
 
     /// What this link has seen so far.
     pub fn metrics(&self) -> LinkMetrics {
-        self.metrics
+        LinkMetrics {
+            queue_drops: self.queue.drops(),
+            ..self.metrics
+        }
+    }
+
+    /// Bytes waiting in the send queue, as counted against its caps.
+    pub fn queued_bytes(&self) -> usize {
+        Channel::ALL
+            .iter()
+            .map(|&channel| self.queue.queued_bytes(channel))
+            .sum()
     }
 
     /// The current state.

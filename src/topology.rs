@@ -61,9 +61,11 @@ const REJECTION_STRIKES: u8 = 3;
 /// The effective cap never drops below this.
 const MIN_EFFECTIVE_CAP: usize = 1;
 
-/// What a link was admitted for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LinkClass {
+/// The slot a link holds under the topology policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
+pub enum LinkClass {
     /// A link inside the stable target: kept while it is healthy.
     Stable,
     /// The single slot above the stable target that keeps a node
@@ -443,9 +445,8 @@ impl PeerTable {
         })
     }
 
-    /// The number of tracked peers; tests only.
-    #[cfg(test)]
-    fn tracked(&self) -> usize {
+    /// The number of tracked peers.
+    pub(crate) fn tracked(&self) -> usize {
         self.entries.len()
     }
 

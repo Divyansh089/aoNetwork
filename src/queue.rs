@@ -59,6 +59,28 @@ pub struct SendOpts {
     pub expires_at: Option<Duration>,
 }
 
+/// Frames a send queue discarded without writing them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
+pub struct QueueDrops {
+    /// Dropped past their `expires_at`.
+    pub expired: u64,
+    /// Oldest Telemetry frames evicted to admit a newer one.
+    pub evicted: u64,
+    /// Replaced in place by a newer payload with the same coalesce key.
+    pub coalesced: u64,
+}
+
+impl QueueDrops {
+    /// Adds `other` to these counts, saturating.
+    pub(crate) fn add(&mut self, other: QueueDrops) {
+        self.expired = self.expired.saturating_add(other.expired);
+        self.evicted = self.evicted.saturating_add(other.evicted);
+        self.coalesced = self.coalesced.saturating_add(other.coalesced);
+    }
+}
+
 /// One queued payload, with the options it was admitted under.
 #[derive(Debug)]
 struct Queued {
@@ -113,6 +135,8 @@ pub struct SendQueue {
     turn: usize,
     /// Whether that channel has had its quantum for this turn.
     granted: bool,
+    /// What was discarded unwritten so far.
+    drops: QueueDrops,
 }
 
 impl SendQueue {
@@ -125,6 +149,7 @@ impl SendQueue {
             deficit: [0; 4],
             turn: 0,
             granted: false,
+            drops: QueueDrops::default(),
         }
     }
 
@@ -176,6 +201,7 @@ impl SendQueue {
                 }
                 // `freed` is part of `queued`, so the subtraction cannot underflow.
                 self.queued[i] = self.queued[i] - freed + cost;
+                self.drops.coalesced = self.drops.coalesced.saturating_add(1);
                 slot.payload = payload;
                 slot.expires_at = opts.expires_at;
                 return Ok(());
@@ -192,6 +218,7 @@ impl SendQueue {
                     match self.entries[i].pop_front() {
                         Some(oldest) => {
                             self.queued[i] -= data_frame_len(oldest.payload.len());
+                            self.drops.evicted = self.drops.evicted.saturating_add(1);
                         }
                         None => break,
                     }
@@ -261,15 +288,18 @@ impl SendQueue {
         for channel in Channel::ALL {
             let i = channel.index();
             let mut freed = 0usize;
+            let mut expired = 0u64;
             self.entries[i].retain(|entry| {
                 if entry.expires_at.is_some_and(|deadline| deadline <= now) {
                     freed += data_frame_len(entry.payload.len());
+                    expired += 1;
                     false
                 } else {
                     true
                 }
             });
             self.queued[i] -= freed;
+            self.drops.expired = self.drops.expired.saturating_add(expired);
         }
     }
 
@@ -290,6 +320,11 @@ impl SendQueue {
     /// at the caller's `now`.
     pub fn queued_bytes(&self, channel: Channel) -> usize {
         self.queued[channel.index()]
+    }
+
+    /// Frames discarded unwritten since the queue was made.
+    pub fn drops(&self) -> QueueDrops {
+        self.drops
     }
 
     /// Whether nothing is queued.
