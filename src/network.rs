@@ -23,6 +23,15 @@
 //! `LinkDown` once after it, when that link ends. Links that never come up
 //! produce no events, nor does a link closed at its handshake as a
 //! duplicate.
+//!
+//! # Observability
+//!
+//! Each link has a `tracing` span, `link{id peer role class}`, under which
+//! its opening, coming up, closing and ending are logged; strikes,
+//! blacklisting and discovery mode changes are logged too. Nothing is
+//! logged unless the app installs a subscriber.
+//! [`snapshot`](Network::snapshot) returns the node's state and its
+//! cumulative [`Counters`].
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::{Future, poll_fn};
@@ -31,6 +40,7 @@ use std::time::Duration;
 
 use crate::discovery::{DiscoveryController, Inputs};
 use crate::guard::AbuseGuard;
+use crate::observe::{Counters, Hex, LinkSnapshot, Snapshot};
 use crate::topology::{
     ClassCounts, Cooldowns, LinkClass, PeerTable, ReadyLink, TopologyPolicy, duplicate_loser,
 };
@@ -108,6 +118,8 @@ struct Entry {
     /// The tag the peer sent, once the link is up.
     remote_tag: Option<LocalTag>,
     up: bool,
+    /// Everything logged about this link is logged under this span.
+    span: tracing::Span,
 }
 
 /// The link layer of one node.
@@ -223,6 +235,9 @@ pub struct Network<T> {
     idle: bool,
     /// Hints barred after their opportunistic link ended.
     cooldowns: Cooldowns,
+    /// What the node has done so far; queue drops cover ended links only,
+    /// live ones are added by `snapshot`.
+    counters: Counters,
     events: VecDeque<NetworkEvent>,
 }
 
@@ -256,6 +271,7 @@ impl<T: Transport> Network<T> {
             discovery,
             idle: false,
             cooldowns,
+            counters: Counters::default(),
             events: VecDeque::new(),
         }
     }
@@ -344,9 +360,18 @@ impl<T: Transport> Network<T> {
         let Some(entry) = self.links.get_mut(&link).filter(|e| e.up) else {
             return Err(SendError::LinkClosed(payload));
         };
-        let actions = entry.machine.send_opts(now, channel, payload, opts)?;
-        self.apply(now, link, actions);
-        Ok(())
+        match entry.machine.send_opts(now, channel, payload, opts) {
+            Ok(actions) => {
+                self.apply(now, link, actions);
+                Ok(())
+            }
+            Err(err) => {
+                if matches!(err, SendError::QueueFull(_)) {
+                    self.counters.queue_full = self.counters.queue_full.saturating_add(1);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Sends a copy of `payload` on `channel` of every up link, as of
@@ -414,6 +439,40 @@ impl<T: Transport> Network<T> {
                 metrics: entry.machine.metrics(),
             })
             .collect()
+    }
+
+    /// The node as it stands at `now`, for a debug screen or a
+    /// diagnostics bundle: its discovery mode, every link in any state,
+    /// the size of its peer table, how many peers are blacklisted, and
+    /// its cumulative [`Counters`]. With the `serde` feature it
+    /// serializes.
+    pub fn snapshot(&self, now: Duration) -> Snapshot {
+        let mut counters = self.counters;
+        let links = self
+            .links
+            .iter()
+            .map(|(&link, entry)| {
+                let metrics = entry.machine.metrics();
+                counters.queue_drops.add(metrics.queue_drops);
+                LinkSnapshot {
+                    link,
+                    peer: entry.peer,
+                    role: entry.role,
+                    class: entry.class,
+                    state: entry.machine.state(),
+                    metrics,
+                    queued_bytes: entry.machine.queued_bytes(),
+                }
+            })
+            .collect();
+        Snapshot {
+            at: now,
+            mode: self.discovery.mode(),
+            links,
+            peers: self.table.tracked(),
+            blocked: self.guard.blocked(now),
+            counters,
+        }
     }
 
     /// The earliest time a timer is due; poll again by then.
@@ -487,6 +546,7 @@ impl<T: Transport> Network<T> {
                 ..
             } => {
                 if !self.accept(now, *link, *peer) {
+                    tracing::debug!(peer = %Hex(peer.as_bytes()), "inbound link refused");
                     self.transport.disconnect(*link);
                     return;
                 }
@@ -595,8 +655,7 @@ impl<T: Transport> Network<T> {
     /// Admits an inbound link, if a `Hello` to send and a slot of some
     /// class are free. The policy decides, not the caller: an inbound
     /// link consumes the same stable or explore slot an outbound one
-    /// would, and never the opportunistic slot (NET-22 owns it), and a
-    /// peer below the policy's admission floor is refused the same way
+    /// would, and a peer below the policy's admission floor is refused the same way
     /// a candidate would be, so an evicted weak peer cannot walk
     /// straight back in while it is still weak. A peer that has never
     /// been seen cannot be judged and is admitted.
@@ -674,6 +733,14 @@ impl<T: Transport> Network<T> {
         hello: Hello,
     ) {
         let local_tag = hello.tag;
+        let span = tracing::info_span!(
+            "link",
+            id = link.raw(),
+            peer = %Hex(peer.as_bytes()),
+            role = ?role,
+            class = ?class,
+        );
+        tracing::debug!(parent: &span, "opened");
         self.links.insert(
             link,
             Entry {
@@ -685,6 +752,7 @@ impl<T: Transport> Network<T> {
                 local_tag,
                 remote_tag: None,
                 up: false,
+                span,
             },
         );
         self.peers.insert(peer, link);
@@ -712,10 +780,17 @@ impl<T: Transport> Network<T> {
             .map(|(&link, _)| link)
             .collect();
         for link in dwelt {
+            if let Some(entry) = self.links.get(&link) {
+                tracing::info!(parent: &entry.span, "dwell over, closing");
+            }
             self.disconnect(now, link, DisconnectReason::DegreeCap);
         }
         let inputs = self.discovery_inputs();
+        let mode = self.discovery.mode();
         if self.discovery.poll(now, &inputs) {
+            if self.discovery.mode() != mode {
+                tracing::info!(mode = ?self.discovery.mode(), "discovery mode changed");
+            }
             self.apply_profiles(Some(now));
         }
     }
@@ -735,21 +810,24 @@ impl<T: Transport> Network<T> {
             match action {
                 LinkAction::Write(chunk) => self.transport.write(link, chunk),
                 LinkAction::Disconnect => self.transport.disconnect(link),
-                LinkAction::Ready { remote, .. } => {
-                    match self.duplicate_to_close(link, remote.tag) {
-                        Some(loser) if loser == link => {
+                LinkAction::Ready { remote, version } => {
+                    if let Some(loser) = self.duplicate_to_close(link, remote.tag) {
+                        if let Some(entry) = self.links.get(&loser) {
+                            tracing::info!(parent: &entry.span, "duplicate, closing");
+                        }
+                        self.disconnect(now, loser, DisconnectReason::Duplicate);
+                        if loser == link {
                             // Never announced, so it ends without events.
-                            self.disconnect(now, link, DisconnectReason::Duplicate);
                             continue;
                         }
-                        Some(loser) => self.disconnect(now, loser, DisconnectReason::Duplicate),
-                        None => {}
                     }
                     if let Some(entry) = self.links.get_mut(&link) {
                         entry.up = true;
                         entry.remote_tag = Some(remote.tag);
                         self.table.mark_linked(&entry.peer);
+                        tracing::info!(parent: &entry.span, version, "up");
                     }
+                    self.counters.links_up = self.counters.links_up.saturating_add(1);
                     self.policy.note_success();
                     self.events.push_back(NetworkEvent::LinkUp {
                         link,
@@ -779,6 +857,19 @@ impl<T: Transport> Network<T> {
         let Some(entry) = self.links.remove(&link) else {
             return;
         };
+        match end {
+            LinkEnd::Disconnected(reason) => {
+                tracing::info!(parent: &entry.span, ?reason, "down");
+                self.counters.links_down.count(reason);
+            }
+            LinkEnd::ConnectFailed(error) => {
+                tracing::debug!(parent: &entry.span, ?error, "connect failed");
+                self.counters.connects_failed = self.counters.connects_failed.saturating_add(1);
+            }
+        }
+        self.counters
+            .queue_drops
+            .add(entry.machine.metrics().queue_drops);
         if entry.role == LinkRole::Initiator
             && matches!(end, LinkEnd::ConnectFailed(ConnectError::Rejected))
         {
@@ -852,6 +943,7 @@ impl<T: Transport> Network<T> {
     /// else is not the peer's fault. A newly blacklisted peer loses every
     /// other link it holds here.
     fn judge(&mut self, now: Duration, peer: PeerKey, reason: DisconnectReason) {
+        let was_blocked = self.guard.is_blocked(&peer, now);
         let blocked = match reason {
             DisconnectReason::AbuseDetected => {
                 self.guard.block(now, peer);
@@ -859,12 +951,18 @@ impl<T: Transport> Network<T> {
             }
             DisconnectReason::ProtocolViolation
             | DisconnectReason::HandshakeFailed(HandshakeFailure::OversizeHello) => {
+                self.counters.strikes = self.counters.strikes.saturating_add(1);
+                tracing::warn!(peer = %Hex(peer.as_bytes()), ?reason, "strike");
                 self.guard.strike(now, peer)
             }
             _ => false,
         };
         if !blocked {
             return;
+        }
+        if !was_blocked {
+            self.counters.blacklisted = self.counters.blacklisted.saturating_add(1);
+            tracing::warn!(peer = %Hex(peer.as_bytes()), ?reason, "blacklisted");
         }
         let held: Vec<LinkId> = self
             .links
@@ -920,6 +1018,9 @@ impl<T: Transport> Network<T> {
             let Some(worst) = worst else {
                 return;
             };
+            if let Some(entry) = self.links.get(&worst) {
+                tracing::info!(parent: &entry.span, "degraded, evicting");
+            }
             self.disconnect(now, worst, DisconnectReason::DegreeCap);
         }
     }

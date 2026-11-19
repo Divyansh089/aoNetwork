@@ -179,6 +179,14 @@ impl AbuseGuard {
     fn tracked(&self) -> usize {
         self.records.len()
     }
+
+    /// The number of peers blacklisted at `now`.
+    pub(crate) fn blocked(&self, now: Duration) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.blocked && now < record.until)
+            .count()
+    }
 }
 
 #[cfg(test)]

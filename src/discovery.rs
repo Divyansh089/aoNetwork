@@ -20,6 +20,7 @@ pub(crate) const QUIET_PAUSE_INTERVALS: u32 = 5;
 ///
 /// Read with [`Network::discovery_mode`](crate::Network::discovery_mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum DiscoveryMode {
     /// Below the stable target degree: scan and advertise at low latency.
     Aggressive,

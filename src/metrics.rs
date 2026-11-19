@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::QueueDrops;
+
 /// Weight of a new sample in the moving averages: 1/8, as for TCP's
 /// smoothed RTT (RFC 6298), so one outlier moves the average little.
 const EWMA_SHIFT: u32 = 3;
@@ -9,6 +11,7 @@ const EWMA_SHIFT: u32 = 3;
 /// What one link has seen so far. Bytes are counted as chunks on the
 /// radio, headers included.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub struct LinkMetrics {
     /// Moving average of RSSI readings in dBm, if the radio reports any.
@@ -24,6 +27,8 @@ pub struct LinkMetrics {
     pub dropped_frames: u64,
     /// When the last chunk arrived.
     pub last_rx: Option<Duration>,
+    /// Frames this link's send queue discarded unwritten.
+    pub queue_drops: QueueDrops,
 }
 
 /// One step of an RSSI moving average: the sample pulled 1/8 of the way

@@ -29,6 +29,7 @@
 //! |---|---|---|
 //! | `sim` | yes | in-memory `SimWorld` transport (NET-09) |
 //! | `native` | no | `NativeTransport` adapter for the Kotlin BLE shim (NET-14) |
+//! | `serde` | no | `Serialize` for [`Network::snapshot`] and the types in it (NET-23) |
 //!
 //! # Example
 //!
@@ -60,6 +61,7 @@ mod metrics;
 #[cfg(feature = "native")]
 mod native;
 mod network;
+mod observe;
 mod queue;
 #[cfg(feature = "sim")]
 mod sim;
@@ -86,9 +88,11 @@ pub use native::{
     NativeStatus, NativeTransport, ScanMode, Stage,
 };
 pub use network::{LinkInfo, Network, NetworkEvent};
-pub use queue::{SendOpts, SendQueue};
+pub use observe::{Counters, DownCounts, LinkSnapshot, Snapshot};
+pub use queue::{QueueDrops, SendOpts, SendQueue};
 #[cfg(feature = "sim")]
 pub use sim::{NodeId, SIM_RSSI, SimConfig, SimError, SimNode, SimTransport, SimWorld};
+pub use topology::LinkClass;
 pub use transport::{
     AdvProfile, PowerMode, RadioState, ScanProfile, Transport, TransportCaps, TransportEvent,
 };
