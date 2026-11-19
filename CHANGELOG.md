@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add `NativeTransport` (feature `native`): the `Transport` over the Kotlin
+  BLE shim, with `NativeSink`, `NativeEvents`, `NativeHandle`, `NativeConfig`,
+  `NativeStatus` and the status mapping of `docs/native-contract.md`.
 - Topology policy (NET-16): the link manager admits links through a
   `TopologyPolicy` derived from `max_links` and `min_rssi` - stable
   slots up to `max_stable` (the stable target plus one, so a healthy

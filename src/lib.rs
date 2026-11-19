@@ -55,6 +55,8 @@ mod config;
 mod error;
 mod link;
 mod metrics;
+#[cfg(feature = "native")]
+mod native;
 mod network;
 mod queue;
 #[cfg(feature = "sim")]
@@ -74,6 +76,11 @@ pub use error::{
 };
 pub use link::{Link, LinkAction, LinkEnd, LinkState};
 pub use metrics::LinkMetrics;
+#[cfg(feature = "native")]
+pub use native::{
+    AdvertiseMode, DiscoveryKind, NativeConfig, NativeEvents, NativeHandle, NativeSink,
+    NativeStatus, NativeTransport, ScanMode, Stage,
+};
 pub use network::{LinkInfo, Network, NetworkEvent};
 pub use queue::{SendOpts, SendQueue};
 #[cfg(feature = "sim")]
