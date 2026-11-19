@@ -130,12 +130,21 @@ pub enum DiscoveryKind { Advertise, Scan }
 | `on_write_ready` | The stack accepted the previous `write` (§5.1). |
 | `on_closed` | The link is gone and its `BluetoothGatt` is closed. |
 
-Rust guarantees every `NativeEvents` method returns immediately: it does a
-non-blocking push to a bounded queue (or, for `on_accepted`, an atomic id
-allocation) and never calls back into `NativeSink` from inside it. If the queue
-for link events is full, Rust closes that link; link events are never dropped
-silently. Scan results are latest-wins and may be dropped under load. Calls
-after the transport has shut down are no-ops.
+Rust guarantees every `NativeEvents` method returns immediately: it takes a
+short lock that is never held across a `NativeSink` call or any I/O, appends to
+a bounded queue (for `on_accepted`, also allocates the id), and never calls back
+into `NativeSink` from inside it. If the queue for link events is full
+(`NativeConfig::max_pending_events`), Rust closes that link with
+`TransportLost`; link events are never dropped silently. Scan results are
+latest-wins per peer, held for at most `NativeConfig::max_pending_scans` peers,
+and may be dropped under load; a `beacon` longer than 31 bytes is dropped.
+
+Before the transport starts and after it stops, scan results are dropped and an
+`on_accepted` link is disconnected without being reported. Rust makes those
+disconnects, and any it decides on inside a callback, on its next
+`NativeTransport` call or poll. Callbacks for a `LinkId` that is unknown or
+already closed are ignored. After the transport is dropped, every callback is a
+no-op and `on_accepted` returns `LinkId` 0, which Rust never allocates.
 
 ### 5.1 Write credit
 
@@ -239,8 +248,8 @@ A link that is connected and then drops with a status from
 ## 8. Status mapping (Rust)
 
 Rust applies these tables. Before `on_connected` / `on_accepted` the result is
-a `ConnectError`; afterwards a `DisconnectReason`. The raw `NativeStatus` is
-kept for logs and metrics.
+a `ConnectError`; afterwards a `DisconnectReason`. The raw `NativeStatus` is not
+kept.
 
 ### 8.1 Before the link is up → `ConnectError`
 
@@ -254,7 +263,8 @@ pub enum ConnectError {
 
 | `NativeStatus` | `ConnectError` |
 |---|---|
-| `Requested` | the cause Rust recorded when it called `disconnect` (`Timeout` or `Cancelled`) |
+| `Requested` after Rust called `disconnect` | `Cancelled` (any status; Rust has no connect timeout of its own yet) |
+| `Requested` without a `disconnect` | `Unreachable` |
 | `Gatt { Connect, 0x08 }` (connection timeout), `Gatt { Connect, 0x22 }` (LMP response timeout) | `Timeout` |
 | `Gatt { Connect, 0x09 }` (connection limit), `0x0D` (limited resources), `0x13` (peer terminated), `0x14` (peer low resources), `0x15` (peer power off) | `Rejected` |
 | `Gatt { Connect, 0x3E }` (failed to establish), `0x85` (`GATT_ERROR`), any other code | `Unreachable` |
@@ -262,13 +272,14 @@ pub enum ConnectError {
 | `ServiceMissing` | `ServiceMissing` |
 | `PeerUnknown` | `PeerUnknown` |
 | `RadioOff`, `PermissionDenied` | `RadioUnavailable` |
-| `PeerMisbehaved` | not possible (no inbound link exists yet) |
+| `PeerMisbehaved` | `Unreachable` (not possible: no inbound link exists yet) |
 
 ### 8.2 After the link is up → `DisconnectReason`
 
 | `NativeStatus` | `DisconnectReason` |
 |---|---|
-| `Requested` | the reason Rust recorded when it called `disconnect` |
+| any status after Rust called `disconnect` or `stop` | `Closed` |
+| any status after Rust closed an overflowing link | `TransportLost` |
 | `PeerMisbehaved` | `ProtocolViolation` |
 | everything else | `TransportLost` |
 
@@ -277,7 +288,10 @@ A clean close by the peer arrives as a `Bye` frame before the radio drops, so
 
 ## 9. Mapping to `Transport` (Rust)
 
-`NativeTransport` implements the `Transport` trait over this contract.
+`NativeTransport` implements the `Transport` trait over this contract (feature
+`native`). `NativeTransport::new(sink, NativeConfig)` returns the transport and
+the `NativeHandle` that implements `NativeEvents`; aoheyra hands the handle to
+Kotlin. A `write` without the link's write credit is not passed on.
 
 | `Transport` | `NativeSink` |
 |---|---|
@@ -297,5 +311,5 @@ A clean close by the peer arrives as a `Bye` frame before the radio drops, so
 | `on_mtu_changed`, `on_bytes`, `on_write_ready` | `MtuChanged`, `Received`, `WriteReady` |
 | `on_closed` before / after the link was up | `ConnectFailed` / `Disconnected`, per §8 (`Requested` gives `Cancelled` / `Closed`) |
 
-`on_discovery_failed` is logged; discovery restarts on the next profile change.
+`on_discovery_failed` is ignored; discovery restarts on the next profile change.
 The native shim reports neither `Lost` nor `Rssi`.
