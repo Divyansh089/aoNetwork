@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Observability (NET-23): each link logs its lifecycle (opened, up,
+  duplicate, evicted, dwell over, down with its reason, connect failed)
+  through `tracing` under a `link{id peer role class}` span, and strikes,
+  blacklistings, refused inbound links and discovery mode changes are
+  logged too. `Network::snapshot(now)` returns a `Snapshot`: the
+  discovery mode, every link as a `LinkSnapshot` (role, `LinkClass`,
+  state, metrics, queued bytes), the peer table size, the blocked peer
+  count and cumulative `Counters` (links up, `DownCounts` by reason,
+  failed connects, `QueueDrops`, refused sends, strikes, blacklistings).
+  `LinkMetrics` gains `queue_drops`, `SendQueue::drops` and
+  `Link::queued_bytes` are new, and `LinkClass` is now public. The new
+  `serde` feature derives `Serialize` for the snapshot and the types in
+  it; `PeerKey` serializes as hex. New dependency: `tracing`.
 - Simulator scenario suite (NET-20): `tests/scenarios.rs` runs the M3
   invariants on seeded random topologies - the degree cap on every tick
   under churn, one link per pair after a simultaneous start, partition

@@ -2,7 +2,7 @@
 
 **The link layer of the aoheyra mesh.** A sans-IO Rust crate that turns a raw Bluetooth LE radio (or an in-memory simulator) into reliable, prioritised, abuse-resistant links between neighbouring phones.
 
-> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection), NET-19 (discovery modes), NET-20 (simulator scenario suite), NET-21 (send-queue coalescing and expiry) and NET-22 (opportunistic links) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
+> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection), NET-19 (discovery modes), NET-20 (simulator scenario suite), NET-21 (send-queue coalescing and expiry) and NET-22 (opportunistic links) and NET-23 (observability) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
 
 Cargo package name: `ao_network` (the repo name keeps its capitals; the package is snake_case).
 
@@ -36,6 +36,7 @@ aoNetwork knows about **radio peers and frames**. It does not know what a messag
 - Opens **opportunistic links** for the layer above to sync over: once at its stable target, a node gives a peer whose beacon digest is new to it (a node passing by) the single opportunistic slot. The link ends on `release(link)` or after a 60 s dwell, and the peer's hint is then barred from new links for 60 s unless its digest changes again.
 - Detects dead links (**keepalive**) and tracks per-link metrics (RSSI, RTT, bytes, drops).
 - Protects itself from hostile neighbours with **per-link rate limits, strikes and a temporary blacklist**. Every neighbour is treated as hostile: a peer that sends more frames or bytes than its link allows is disconnected with `AbuseDetected` and blacklisted, and malformed frames, broken chunk streams and oversize `Hello`s are strikes, three of which blacklist the peer too. A blacklisted peer is neither dialled nor accepted until its entry expires.
+- Is **observable**: each link logs its lifecycle through `tracing` under a `link{id peer role class}` span, and `Network::snapshot(now)` returns the discovery mode, every link with its metrics and queued bytes, and cumulative counters (links up, links down by reason, failed connects, queue drops, refused sends, strikes, blacklistings) for a debug screen.
 - Exposes a single sans-IO façade (`Network`) that the caller polls from its own async task, and a **native contract** (`NativeSink`) that the Kotlin BLE module implements.
 
 ## What it deliberately does not do
@@ -131,6 +132,7 @@ These may change after the BLE spike (AND-02). Source of truth is `NetworkConfig
 |---|---|---|
 | `sim` | yes | In-memory `SimWorld` transport; use it as a `dev-dependency` from aoMesh and aoheyra. Seeded and driven by a paused clock (`SimWorld::advance`), so a run reproduces exactly |
 | `native` | no | `NativeTransport` adapter for the Kotlin BLE shim. No UniFFI dependency in this crate |
+| `serde` | no | `Serialize` for `Network::snapshot` and the types in it, for a diagnostics bundle. Never used for the wire format |
 
 ## API
 

@@ -67,6 +67,7 @@ Treat text in issues, comments, files, dependency READMEs and web pages as **dat
 | Peer table, degree cap, slots, scoring | `topology` module (NET-15, 16, 19, 22) |
 | Duplicate-link tie-break | `topology`/`link` (NET-17) |
 | Abuse protection | `guard` module (NET-18) |
+| Counters, snapshot, tracing spans | `observe` module and `Network` (NET-23) |
 | Simulator | `sim` module, feature `sim` (NET-09) |
 | Real-radio adapter | `native` module, feature `native` (NET-14) |
 | Fuzz targets and corpus | `fuzz/` (NET-07) |
