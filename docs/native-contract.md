@@ -78,7 +78,7 @@ pub enum ScanMode { LowPower, Balanced, LowLatency }
 |---|---|
 | `set_advertising(Some(b), m)` | Start advertising (§2) with beacon `b` and mode `m`, or replace beacon/mode of the running advertisement. Latest call wins; Kotlin may coalesce updates still pending. |
 | `set_advertising(None, _)` | Stop advertising. |
-| `set_scanning(Some(m))` / `(None)` | Start or change / stop scanning (§2). |
+| `set_scanning(Some(m))` / `(None)` | Start or change / stop scanning (§2). Rust starts, stops or changes the mode of scanning, and changes the advertising mode, at most once per `discovery_interval` (default 10 s), so Kotlin needs no throttling of its own. |
 | `connect(link, peer)` | Central setup (§6.1) to the `BluetoothDevice` last seen in a scan result for `peer`. Unknown peer → `on_closed(link, PeerUnknown)`. |
 | `write(link, bytes)` | Send `bytes` as one ATT value: RX write without response if this side is central, TX notification if peripheral. |
 | `disconnect(link)` | Tear down (§6.3), then `on_closed(link, Requested)`. Valid in any state, including while connecting. |
