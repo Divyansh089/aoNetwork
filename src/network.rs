@@ -19,14 +19,17 @@
 //!
 //! `LinkUp` comes once per link, after a successful handshake, and
 //! `LinkDown` once after it, when that link ends. Links that never come up
-//! produce no events.
+//! produce no events, nor does a link closed at its handshake as a
+//! duplicate.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::topology::{ClassCounts, LinkClass, PeerTable, TopologyPolicy};
+use crate::topology::{
+    ClassCounts, LinkClass, PeerTable, ReadyLink, TopologyPolicy, duplicate_loser,
+};
 use crate::{
     AdvProfile, AppHello, Beacon, BeaconFlags, Channel, ConnectError, DisconnectReason,
     FRAME_VERSION, Hello, Link, LinkAction, LinkEnd, LinkId, LinkMetrics, LinkRole, LinkState,
@@ -96,6 +99,10 @@ struct Entry {
     /// When it was admitted: eviction spares links younger than the
     /// policy's minimum age.
     opened_at: Duration,
+    /// The tag this node sent on it.
+    local_tag: LocalTag,
+    /// The tag the peer sent, once the link is up.
+    remote_tag: Option<LocalTag>,
     up: bool,
 }
 
@@ -104,9 +111,10 @@ struct Entry {
 /// Until both [`set_local_hello`](Self::set_local_hello) and
 /// [`set_beacon`](Self::set_beacon) are called the node forms no links:
 /// it needs a `Hello` to handshake and a beacon to be found. It connects to
-/// a discovered peer when the topology policy has a slot free, when the
-/// peer's beacon says it is accepting, and when its own beacon hint sorts
-/// below the peer's, so that exactly one side of each pair dials. The peer
+/// a discovered peer when the topology policy has a slot free and the
+/// peer's beacon says it is accepting. Of each pair, the side whose beacon
+/// hint sorts lower dials at once and the other waits 4 s first, so one
+/// connection normally lands before the second is tried. The peer
 /// table gates the rest: a peer must not already be linked, must be past
 /// the backoff of its last failed attempt, must be at or above
 /// `min_rssi`, and must have been seen within the last 30 s. Inbound
@@ -116,6 +124,12 @@ struct Entry {
 /// Once over its stable target the node sheds its weakest degraded link
 /// and keeps strong ones, and three rejected outbound attempts in a
 /// row lower the session's cap.
+///
+/// A peer can still end up with two links, when both sides dial at once
+/// or one radio shows up under two addresses. When a handshake brings up
+/// a second link to the same remote tag, the link opened by the lower tag
+/// is kept and the other closed with [`DisconnectReason::Duplicate`]. A
+/// link whose remote tag is this node's own is closed the same way.
 ///
 /// # Example
 ///
@@ -406,10 +420,13 @@ impl<T: Transport> Network<T> {
 
     /// Starts an outbound connection to `peer` when the peer table and
     /// the local policy allow one now: the peer must be a candidate
-    /// (not linked, past its backoff, accepting, strong, recently seen)
-    /// and its hint must sort below ours, so that exactly one side of
-    /// each pair dials. The link is admitted into the class the policy
+    /// (not linked, past its backoff, accepting, strong, recently seen),
+    /// and unless our hint sorts below the peer's, the initiation delay
+    /// must have passed. The link is admitted into the class the policy
     /// grants from the current inventory: stable first, then explore.
+    ///
+    /// A held-back dial is retried on the peer's next sighting, as a dial
+    /// held by backoff is.
     fn connect_to(&mut self, now: Duration, peer: PeerKey) {
         let (Some(hello), Some(own)) = (&self.hello, &self.beacon) else {
             return;
@@ -423,12 +440,12 @@ impl<T: Transport> Network<T> {
         let Some(hint) = self.table.hint_of(&peer) else {
             return;
         };
-        if own.hint >= hint {
+        if own.hint >= hint && !self.table.waited(&peer, now, self.policy.initiation_delay) {
             return;
         }
-        let machine = Link::new(&self.config, hello.clone());
+        let hello = hello.clone();
         let link = self.transport.connect(peer);
-        self.add(now, link, peer, LinkRole::Initiator, class, machine);
+        self.add(now, link, peer, LinkRole::Initiator, class, hello);
     }
 
     /// Admits an inbound link, if a `Hello` to send and a slot of some
@@ -439,6 +456,11 @@ impl<T: Transport> Network<T> {
     /// a candidate would be, so an evicted weak peer cannot walk
     /// straight back in while it is still weak. A peer that has never
     /// been seen cannot be judged and is admitted.
+    ///
+    /// A peer this node is itself still dialing is admitted too: both
+    /// connections run their handshakes and the duplicate tie-break
+    /// keeps one. Refusing would leave the two ends each refusing the
+    /// other's connection.
     fn accept(&mut self, now: Duration, link: LinkId, peer: PeerKey) -> bool {
         let Some(hello) = &self.hello else {
             return false;
@@ -446,7 +468,8 @@ impl<T: Transport> Network<T> {
         let Some(class) = self.policy.admit(&self.counts()) else {
             return false;
         };
-        if self.peers.contains_key(&peer) {
+        let held = self.peers.get(&peer).and_then(|held| self.links.get(held));
+        if held.is_some_and(|held| held.up || held.role == LinkRole::Responder) {
             return false;
         }
         if self
@@ -456,8 +479,8 @@ impl<T: Transport> Network<T> {
         {
             return false;
         }
-        let machine = Link::new(&self.config, hello.clone());
-        self.add(now, link, peer, LinkRole::Responder, class, machine);
+        let hello = hello.clone();
+        self.add(now, link, peer, LinkRole::Responder, class, hello);
         true
     }
 
@@ -485,6 +508,7 @@ impl<T: Transport> Network<T> {
         self.policy.admit(&self.counts()).is_some()
     }
 
+    /// Tracks a new link that introduces itself with `hello`.
     fn add(
         &mut self,
         now: Duration,
@@ -492,16 +516,19 @@ impl<T: Transport> Network<T> {
         peer: PeerKey,
         role: LinkRole,
         class: LinkClass,
-        machine: Link,
+        hello: Hello,
     ) {
+        let local_tag = hello.tag;
         self.links.insert(
             link,
             Entry {
-                machine,
+                machine: Link::new(&self.config, hello),
                 peer,
                 role,
                 class,
                 opened_at: now,
+                local_tag,
+                remote_tag: None,
                 up: false,
             },
         );
@@ -531,8 +558,18 @@ impl<T: Transport> Network<T> {
                 LinkAction::Write(chunk) => self.transport.write(link, chunk),
                 LinkAction::Disconnect => self.transport.disconnect(link),
                 LinkAction::Ready { remote, .. } => {
+                    match self.duplicate_to_close(link, remote.tag) {
+                        Some(loser) if loser == link => {
+                            // Never announced, so it ends without events.
+                            self.disconnect(now, link, DisconnectReason::Duplicate);
+                            continue;
+                        }
+                        Some(loser) => self.disconnect(now, loser, DisconnectReason::Duplicate),
+                        None => {}
+                    }
                     if let Some(entry) = self.links.get_mut(&link) {
                         entry.up = true;
+                        entry.remote_tag = Some(remote.tag);
                         self.table.mark_linked(&entry.peer);
                     }
                     self.policy.note_success();
@@ -545,6 +582,10 @@ impl<T: Transport> Network<T> {
                     self.enforce_eviction(now);
                 }
                 LinkAction::Data { channel, payload } => {
+                    // A duplicate closed at its handshake was never up.
+                    if !self.links.get(&link).is_some_and(|entry| entry.up) {
+                        continue;
+                    }
                     self.events.push_back(NetworkEvent::Data {
                         link,
                         channel,
@@ -567,9 +608,20 @@ impl<T: Transport> Network<T> {
             // strike that lowers the session's effective cap.
             self.policy.note_rejection();
         }
-        self.table.mark_down(now, &entry.peer);
-        if self.peers.get(&entry.peer) == Some(&link) {
-            self.peers.remove(&entry.peer);
+        let sibling = self
+            .links
+            .iter()
+            .find(|(_, other)| other.peer == entry.peer)
+            .map(|(&other, _)| other);
+        if let Some(sibling) = sibling {
+            // Another link to the same radio carries on, and the peer's
+            // table state and backoff stay with it.
+            self.peers.insert(entry.peer, sibling);
+        } else {
+            self.table.mark_down(now, &entry.peer);
+            if self.peers.get(&entry.peer) == Some(&link) {
+                self.peers.remove(&entry.peer);
+            }
         }
         if let (true, LinkEnd::Disconnected(reason)) = (entry.up, end) {
             self.events
@@ -581,6 +633,29 @@ impl<T: Transport> Network<T> {
         for peer in self.table.candidates(now, &self.peers) {
             self.connect_to(now, peer);
         }
+    }
+
+    /// The link to close now that `link` has completed its handshake
+    /// with a peer that sent `remote`: `link` itself when `remote` is
+    /// this node's own tag, otherwise the tie-break's pick between it
+    /// and a ready link already up to the same tag.
+    fn duplicate_to_close(&self, link: LinkId, remote: LocalTag) -> Option<LinkId> {
+        let entry = self.links.get(&link)?;
+        if remote == entry.local_tag {
+            return Some(link);
+        }
+        let ready = |link, entry: &Entry| ReadyLink {
+            link,
+            role: entry.role,
+            local_tag: entry.local_tag,
+            remote_tag: remote,
+        };
+        let (&held, held_entry) = self.links.iter().find(|(other, other_entry)| {
+            **other != link
+                && other_entry.remote_tag == Some(remote)
+                && other_entry.machine.state() == LinkState::Ready
+        })?;
+        duplicate_loser(&ready(held, held_entry), &ready(link, entry))
     }
 
     /// Sheds the worst link while the node holds more healthy links
@@ -763,6 +838,48 @@ mod tests {
         peers.sort();
         peers.dedup();
         assert_eq!(peers.len(), 5, "every link is to a distinct peer");
+    }
+
+    /// Closing the losing duplicate leaves the peer linked: its table
+    /// entry does not enter backoff, and the peer map points at the
+    /// surviving link.
+    #[test]
+    fn a_closed_duplicate_leaves_the_peer_linked() {
+        use crate::topology::PeerState;
+        let world = SimWorld::new(SimConfig {
+            connect_jitter: Duration::ZERO,
+            ..SimConfig::default()
+        });
+        let mut nets: Vec<Network<SimTransport>> = (1..=2u8)
+            .map(|i| {
+                let radio = world.add_node(SimNode::default()).unwrap();
+                let mut net = Network::new(NetworkConfig::default(), radio);
+                net.set_local_hello(LocalTag::new([i; 16]), AppHello::new(Vec::new()).unwrap());
+                // Equal hints: both dial once the delay has passed.
+                net.set_beacon(
+                    [7; 8],
+                    [0; 4],
+                    BeaconFlags {
+                        accepting: true,
+                        ..BeaconFlags::default()
+                    },
+                );
+                net
+            })
+            .collect();
+        let (a, b) = (nets[0].transport().node(), nets[1].transport().node());
+        world.set_in_range(a, b, true);
+        run(&world, &mut nets, Duration::from_secs(8));
+
+        for (net, other) in [(&nets[0], &nets[1]), (&nets[1], &nets[0])] {
+            let peer = other.transport().peer_key();
+            let [info] = net.links()[..] else {
+                panic!("one link expected: {:?}", net.links());
+            };
+            assert_eq!(net.links.len(), 1, "the duplicate is gone");
+            assert_eq!(net.peers.get(&peer), Some(&info.link));
+            assert_eq!(net.table.state(&peer), Some(PeerState::Linked));
+        }
     }
 
     /// Three rejected outbound attempts in a row lower the session's

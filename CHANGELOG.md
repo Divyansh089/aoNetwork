@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Duplicate-link resolution (NET-17): the side of a pair whose beacon
+  hint sorts higher (or equal) now dials after a 4 s initiation delay
+  instead of never, so pairs with equal hints, or whose lower side
+  never dials, still link. An inbound connection from a peer this node
+  is itself still dialing is accepted, and when a second link to the
+  same remote tag completes its handshake, the one opened by the lower
+  tag is kept and the other closed with `DisconnectReason::Duplicate`.
+  A loser that was never announced ends without events. A link whose
+  remote tag is this node's own is closed the same way.
 - Add `NativeTransport` (feature `native`): the `Transport` over the Kotlin
   BLE shim, with `NativeSink`, `NativeEvents`, `NativeHandle`, `NativeConfig`,
   `NativeStatus` and the status mapping of `docs/native-contract.md`.

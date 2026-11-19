@@ -367,7 +367,8 @@ pub enum DisconnectReason {
     AbuseDetected,
     /// Evicted to stay within the degree cap.
     DegreeCap,
-    /// Lost a duplicate-link tie-break against a better link.
+    /// Lost the duplicate-link tie-break to another link with the same
+    /// peer, or the peer introduced itself with this node's own tag.
     Duplicate,
     /// The underlying transport or radio went away.
     TransportLost,

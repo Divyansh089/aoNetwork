@@ -17,12 +17,19 @@
 //! is dialed first, decides when a held link has degraded far enough
 //! to evict, and lowers the session's effective cap after repeated
 //! rejections.
+//!
+//! Duplicate links (NET-17) are kept rare and then settled. The side
+//! whose beacon hint sorts lower dials a new neighbour at once; the
+//! other side waits [`INITIATION_DELAY`] first, so its own connection
+//! is normally made redundant by the inbound one. When both connect
+//! anyway, [`duplicate_loser`] picks the one link both ends close.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use crate::metrics::rssi_ewma;
-use crate::{Beacon, LinkId, NetworkConfig, PeerKey};
+use crate::{Beacon, LinkId, LinkRole, LocalTag, NetworkConfig, PeerKey};
 
 /// Entries unseen for longer than this are evicted, so a peer that stops
 /// advertising does not hold memory or a candidate slot forever.
@@ -39,6 +46,10 @@ pub(crate) const DWELL: Duration = Duration::from_secs(60);
 /// How long a peer that lost a slot stays barred from getting it back
 /// unless its beacon digest changes (NET-22).
 pub(crate) const COOLDOWN: Duration = Duration::from_secs(60);
+/// How long the side whose hint does not sort lower waits before dialing
+/// a newly connectable peer itself. It covers the other side's scan lag
+/// plus its connect time, so simultaneous connects stay rare.
+pub(crate) const INITIATION_DELAY: Duration = Duration::from_secs(4);
 /// Consecutive outbound rejections that lower the effective cap.
 const REJECTION_STRIKES: u8 = 3;
 /// The effective cap never drops below this.
@@ -103,6 +114,8 @@ pub(crate) struct TopologyPolicy {
     pub(crate) admit_floor: i16,
     /// A link younger than this is never evicted.
     pub(crate) link_min_age: Duration,
+    /// How long the higher-hint side of a pair holds back its dial.
+    pub(crate) initiation_delay: Duration,
     /// How long an opportunistic link may hold its slot (NET-22).
     #[allow(dead_code)] // Enforced by NET-22; stored so the policy owns every listed knob.
     pub(crate) dwell: Duration,
@@ -134,6 +147,7 @@ impl TopologyPolicy {
             max_total,
             admit_floor: config.min_rssi(),
             link_min_age: LINK_MIN_AGE,
+            initiation_delay: INITIATION_DELAY,
             dwell: DWELL,
             cooldown: COOLDOWN,
             effective_cap: max_total,
@@ -381,6 +395,19 @@ impl PeerTable {
         self.entries.get(peer)?.beacon.map(|beacon| beacon.hint)
     }
 
+    /// Whether `delay` has passed at `now` since `peer` last became
+    /// connectable: since it was first seen or since its backoff ended,
+    /// whichever is later.
+    pub(crate) fn waited(&self, peer: &PeerKey, now: Duration, delay: Duration) -> bool {
+        self.entries.get(peer).is_some_and(|entry| {
+            entry
+                .first_seen
+                .max(entry.next_attempt_at)
+                .checked_add(delay)
+                .is_some_and(|due| now >= due)
+        })
+    }
+
     /// The number of tracked peers; tests only.
     #[cfg(test)]
     fn tracked(&self) -> usize {
@@ -389,8 +416,44 @@ impl PeerTable {
 
     /// The recorded state of `peer`; tests only.
     #[cfg(test)]
-    fn state(&self, peer: &PeerKey) -> Option<PeerState> {
+    pub(crate) fn state(&self, peer: &PeerKey) -> Option<PeerState> {
         self.entries.get(peer).map(|entry| entry.state)
+    }
+}
+
+/// A ready link as the duplicate-link tie-break sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadyLink {
+    pub(crate) link: LinkId,
+    pub(crate) role: LinkRole,
+    /// The tag this node sent on it.
+    pub(crate) local_tag: LocalTag,
+    /// The tag the peer sent on it.
+    pub(crate) remote_tag: LocalTag,
+}
+
+impl ReadyLink {
+    /// The tag of the side that opened the link.
+    fn initiator(&self) -> LocalTag {
+        match self.role {
+            LinkRole::Initiator => self.local_tag,
+            LinkRole::Responder => self.remote_tag,
+        }
+    }
+}
+
+/// Which of two ready links with the same remote tag this node closes,
+/// `held` being up already and `new` having just finished its handshake.
+///
+/// The link opened by the lower tag stays. Both ends compute the same
+/// answer whatever order their handshakes finish in, so they never close
+/// both links. Two links opened by the same side are settled by that
+/// side alone, which closes the newer; the other end closes neither.
+pub(crate) fn duplicate_loser(held: &ReadyLink, new: &ReadyLink) -> Option<LinkId> {
+    match held.initiator().cmp(&new.initiator()) {
+        Ordering::Less => Some(new.link),
+        Ordering::Greater => Some(held.link),
+        Ordering::Equal => (new.role == LinkRole::Initiator).then_some(new.link),
     }
 }
 
@@ -661,6 +724,7 @@ mod tests {
         assert_eq!(policy.effective_cap, 5);
         assert_eq!(policy.admit_floor, -90);
         assert_eq!(policy.link_min_age, Duration::from_secs(10));
+        assert_eq!(policy.initiation_delay, Duration::from_secs(4));
         assert_eq!(policy.dwell, Duration::from_secs(60));
         assert_eq!(policy.cooldown, Duration::from_secs(60));
 
@@ -777,5 +841,65 @@ mod tests {
         table.observe(Duration::ZERO, PEER, -60, &raw(true));
         assert!(table.score_of(&PEER).is_some());
         assert_eq!(table.candidates(Duration::ZERO, &no_links()), [PEER]);
+    }
+
+    /// The higher-hint side may dial once the delay has passed since the
+    /// peer was first seen, and after a failure only that long after the
+    /// backoff ends.
+    #[test]
+    fn the_initiation_delay_runs_from_the_latest_connectable_moment() {
+        let mut table = table();
+        let delay = INITIATION_DELAY;
+        assert!(!table.waited(&PEER, delay, delay), "unknown peer");
+        table.observe(Duration::from_secs(1), PEER, -60, &raw(true));
+        assert!(!table.waited(&PEER, Duration::from_secs(4), delay));
+        assert!(table.waited(&PEER, Duration::from_secs(5), delay));
+
+        table.mark_connecting(&PEER);
+        table.mark_down(Duration::from_secs(5), &PEER);
+        let due = table.entries[&PEER].next_attempt_at;
+        assert!(!table.waited(&PEER, due + delay - Duration::from_millis(1), delay));
+        assert!(table.waited(&PEER, due + delay, delay));
+        // A delay that overflows the clock never elapses.
+        assert!(!table.waited(&PEER, Duration::MAX, Duration::MAX));
+    }
+
+    fn ready(link: u64, role: LinkRole, local: u8, remote: u8) -> ReadyLink {
+        ReadyLink {
+            link: LinkId::new(link),
+            role,
+            local_tag: LocalTag::new([local; 16]),
+            remote_tag: LocalTag::new([remote; 16]),
+        }
+    }
+
+    /// Simultaneous connects: each end holds one link it opened and one
+    /// it accepted. Both ends close the link opened by the higher tag,
+    /// whichever handshake finished first.
+    #[test]
+    fn the_link_opened_by_the_lower_tag_stays() {
+        use LinkRole::{Initiator, Responder};
+        // Node 1 (tag 1) opened the connection seen as 10 at its end and
+        // 20 at node 2's; node 2 (tag 2) opened 21, seen as 11 at node 1.
+        let one_out = ready(10, Initiator, 1, 2);
+        let one_in = ready(11, Responder, 1, 2);
+        let two_in = ready(20, Responder, 2, 1);
+        let two_out = ready(21, Initiator, 2, 1);
+        // Node 1 drops 11 and node 2 drops 21: the same connection.
+        assert_eq!(duplicate_loser(&one_out, &one_in), Some(one_in.link));
+        assert_eq!(duplicate_loser(&one_in, &one_out), Some(one_in.link));
+        assert_eq!(duplicate_loser(&two_in, &two_out), Some(two_out.link));
+        assert_eq!(duplicate_loser(&two_out, &two_in), Some(two_out.link));
+    }
+
+    /// Two links opened by the same side: only that side closes one,
+    /// the newer, so the ends never close both.
+    #[test]
+    fn a_double_dial_is_settled_by_the_dialer() {
+        use LinkRole::{Initiator, Responder};
+        let (old, new) = (ready(1, Initiator, 1, 2), ready(2, Initiator, 1, 2));
+        assert_eq!(duplicate_loser(&old, &new), Some(new.link));
+        let (old, new) = (ready(1, Responder, 2, 1), ready(2, Responder, 2, 1));
+        assert_eq!(duplicate_loser(&old, &new), None);
     }
 }
