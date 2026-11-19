@@ -15,6 +15,7 @@
 //! | [`send`](Network::send), [`send_opts`](Network::send_opts) | `Data` at the peer, or a [`SendError`] here |
 //! | [`broadcast`](Network::broadcast) | `send` to every up link |
 //! | [`disconnect`](Network::disconnect) | `LinkDown` after an up link closes; no event for a cancelled connection attempt |
+//! | [`release`](Network::release) | as `disconnect` with `Closed`, for an opportunistic link only |
 //! | [`links`](Network::links) | none; lists the up links |
 //! | [`set_idle`](Network::set_idle) | none; switches discovery to [`DiscoveryMode::Quiet`] from the next poll |
 //!
@@ -31,7 +32,7 @@ use std::time::Duration;
 use crate::discovery::{DiscoveryController, Inputs};
 use crate::guard::AbuseGuard;
 use crate::topology::{
-    ClassCounts, LinkClass, PeerTable, ReadyLink, TopologyPolicy, duplicate_loser,
+    ClassCounts, Cooldowns, LinkClass, PeerTable, ReadyLink, TopologyPolicy, duplicate_loser,
 };
 use crate::{
     AdvProfile, AppHello, Beacon, BeaconFlags, Channel, ConnectError, DisconnectReason,
@@ -152,6 +153,13 @@ struct Entry {
 /// with pauses of five, so the radio never restarts its scanner faster
 /// than Android allows. Beacon content changes are not held back.
 ///
+/// Once at its stable target, the node also opens a short opportunistic
+/// link to a peer whose beacon digest is new to it, such as a node
+/// passing by, so the layer above can sync with it. The link holds the
+/// single opportunistic slot until [`release`](Self::release) or a 60 s
+/// dwell, and the peer's hint is then barred from new links for 60 s
+/// unless its digest changes again.
+///
 /// # Example
 ///
 /// ```
@@ -213,6 +221,8 @@ pub struct Network<T> {
     discovery: DiscoveryController,
     /// The caller says the node is idle.
     idle: bool,
+    /// Hints barred after their opportunistic link ended.
+    cooldowns: Cooldowns,
     events: VecDeque<NetworkEvent>,
 }
 
@@ -230,6 +240,7 @@ impl<T: Transport> Network<T> {
             idle: false,
         };
         let discovery = DiscoveryController::new(&config, &inputs);
+        let cooldowns = Cooldowns::new(&config);
         Self {
             config,
             transport,
@@ -244,6 +255,7 @@ impl<T: Transport> Network<T> {
             guard,
             discovery,
             idle: false,
+            cooldowns,
             events: VecDeque::new(),
         }
     }
@@ -376,6 +388,20 @@ impl<T: Transport> Network<T> {
         }
     }
 
+    /// Ends an opportunistic `link` the layer above has finished with,
+    /// as [`disconnect`](Self::disconnect) with
+    /// [`DisconnectReason::Closed`]. Its peer's hint then cools down.
+    /// Links of any other class, and unknown links, are left alone.
+    pub fn release(&mut self, now: Duration, link: LinkId) {
+        if self
+            .links
+            .get(&link)
+            .is_some_and(|entry| entry.class == LinkClass::Opportunistic)
+        {
+            self.disconnect(now, link, DisconnectReason::Closed);
+        }
+    }
+
     /// The up links, in `LinkId` order.
     pub fn links(&self) -> Vec<LinkInfo> {
         self.links
@@ -396,6 +422,11 @@ impl<T: Transport> Network<T> {
             .values()
             .filter_map(|entry| entry.machine.next_deadline())
             .chain(self.discovery.next_deadline(&self.discovery_inputs()))
+            .chain(
+                self.links
+                    .values()
+                    .filter_map(|entry| self.dwell_end(entry)),
+            )
             .min()
     }
 
@@ -435,6 +466,12 @@ impl<T: Transport> Network<T> {
             }
             TransportEvent::Discovered { peer, rssi, beacon } => {
                 let fresh = self.table.observe(now, *peer, *rssi, beacon);
+                // Retried on every sighting while the digest stays new, so a
+                // dial held back by the delay, the cooldown or a busy slot
+                // is not lost.
+                if fresh && self.table.unsynced(peer) {
+                    self.connect_opportunistic(now, *peer);
+                }
                 if fresh {
                     self.connect_to(now, *peer);
                 }
@@ -486,7 +523,10 @@ impl<T: Transport> Network<T> {
         let Some(class) = self.policy.admit(&self.counts()) else {
             return;
         };
-        if !self.table.eligible(&peer, now, &self.peers) || self.guard.is_blocked(&peer, now) {
+        if !self.table.eligible(&peer, now, &self.peers)
+            || self.guard.is_blocked(&peer, now)
+            || self.cooling(&peer, now)
+        {
             return;
         }
         let Some(hint) = self.table.hint_of(&peer) else {
@@ -498,6 +538,58 @@ impl<T: Transport> Network<T> {
         let hello = hello.clone();
         let link = self.transport.connect(peer);
         self.add(now, link, peer, LinkRole::Initiator, class, hello);
+    }
+
+    /// Starts an opportunistic link to `peer`, whose beacon digest is new
+    /// to this node, if the policy has the opportunistic slot free and the
+    /// peer is a candidate that is neither blacklisted nor cooling down.
+    /// The same hint rule and initiation delay as
+    /// [`connect_to`](Self::connect_to) decide which side dials first.
+    fn connect_opportunistic(&mut self, now: Duration, peer: PeerKey) {
+        let (Some(hello), Some(own)) = (&self.hello, &self.beacon) else {
+            return;
+        };
+        if !self.policy.admit_opportunistic(&self.counts())
+            || !self.table.eligible(&peer, now, &self.peers)
+            || self.guard.is_blocked(&peer, now)
+            || self.cooling(&peer, now)
+        {
+            return;
+        }
+        let Some(hint) = self.table.hint_of(&peer) else {
+            return;
+        };
+        if own.hint >= hint && !self.table.waited(&peer, now, self.policy.initiation_delay) {
+            return;
+        }
+        let hello = hello.clone();
+        let link = self.transport.connect(peer);
+        self.add(
+            now,
+            link,
+            peer,
+            LinkRole::Initiator,
+            LinkClass::Opportunistic,
+            hello,
+        );
+    }
+
+    /// Whether `peer`'s hint is barred at `now` by the cooldown that
+    /// followed its last opportunistic link.
+    fn cooling(&self, peer: &PeerKey, now: Duration) -> bool {
+        self.table
+            .beacon_of(peer)
+            .is_some_and(|beacon| self.cooldowns.bars(now, &beacon))
+    }
+
+    /// When an opportunistic link that is still open must end.
+    fn dwell_end(&self, entry: &Entry) -> Option<Duration> {
+        let open = !matches!(
+            entry.machine.state(),
+            LinkState::Closing | LinkState::Closed
+        );
+        (entry.class == LinkClass::Opportunistic && open)
+            .then(|| entry.opened_at.saturating_add(self.policy.dwell))
     }
 
     /// Admits an inbound link, if a `Hello` to send and a slot of some
@@ -515,16 +607,23 @@ impl<T: Transport> Network<T> {
     /// other's connection.
     ///
     /// A blacklisted peer is refused.
+    ///
+    /// With no stable or explore slot left, the link may take the free
+    /// opportunistic slot. A peer whose hint is cooling down is refused.
     fn accept(&mut self, now: Duration, link: LinkId, peer: PeerKey) -> bool {
         let Some(hello) = &self.hello else {
             return false;
         };
-        let Some(class) = self.policy.admit(&self.counts()) else {
-            return false;
+        let counts = self.counts();
+        let class = match self.policy.admit(&counts) {
+            Some(class) => class,
+            None if self.policy.admit_opportunistic(&counts) => LinkClass::Opportunistic,
+            None => return false,
         };
         let held = self.peers.get(&peer).and_then(|held| self.links.get(held));
         if held.is_some_and(|held| held.up || held.role == LinkRole::Responder)
             || self.guard.is_blocked(&peer, now)
+            || self.cooling(&peer, now)
         {
             return false;
         }
@@ -546,14 +645,13 @@ impl<T: Transport> Network<T> {
             total: self.links.len(),
             stable: 0,
             explore: 0,
+            opportunistic: 0,
         };
         for entry in self.links.values() {
             match entry.class {
                 LinkClass::Stable => counts.stable += 1,
                 LinkClass::Explore => counts.explore += 1,
-                // Opportunistic links count towards the total only;
-                // NET-22 admits them against their own slot.
-                LinkClass::Opportunistic => {}
+                LinkClass::Opportunistic => counts.opportunistic += 1,
             }
         }
         counts
@@ -561,7 +659,8 @@ impl<T: Transport> Network<T> {
 
     /// Whether any class would admit one more link right now.
     fn has_room(&self) -> bool {
-        self.policy.admit(&self.counts()).is_some()
+        let counts = self.counts();
+        self.policy.admit(&counts).is_some() || self.policy.admit_opportunistic(&counts)
     }
 
     /// Tracks a new link that introduces itself with `hello`.
@@ -605,6 +704,15 @@ impl<T: Transport> Network<T> {
                 let actions = entry.machine.on_tick(now);
                 self.apply(now, link, actions);
             }
+        }
+        let dwelt: Vec<LinkId> = self
+            .links
+            .iter()
+            .filter(|(_, entry)| self.dwell_end(entry).is_some_and(|end| end <= now))
+            .map(|(&link, _)| link)
+            .collect();
+        for link in dwelt {
+            self.disconnect(now, link, DisconnectReason::DegreeCap);
         }
         let inputs = self.discovery_inputs();
         if self.discovery.poll(now, &inputs) {
@@ -700,6 +808,14 @@ impl<T: Transport> Network<T> {
         if let LinkEnd::Disconnected(reason) = end {
             self.judge(now, entry.peer, reason);
         }
+        // A duplicate closed beside a surviving link does not end the
+        // peer's time here, so it starts no cooldown.
+        let last = !self.peers.contains_key(&entry.peer);
+        if entry.class == LinkClass::Opportunistic && entry.up && last {
+            if let Some(beacon) = self.table.beacon_of(&entry.peer) {
+                self.cooldowns.start(now, beacon.hint, beacon.digest);
+            }
+        }
         self.apply_profiles(Some(now));
         // A slot just freed: dial the next candidate now rather than
         // waiting for a sighting to say the neighbourhood changed.
@@ -761,8 +877,9 @@ impl<T: Transport> Network<T> {
         }
     }
 
-    /// Sheds the worst link while the node holds more healthy links
-    /// than its stable target: only a link that is up and ready, has
+    /// Sheds the worst link while the node holds more healthy stable or
+    /// explore links than its stable target (an opportunistic link is
+    /// bounded by its dwell instead): only a link that is up and ready, has
     /// survived the policy's minimum age, and whose peer average has
     /// fallen below the admission floor may go, and the weakest score
     /// goes first. Links that are merely over the target but strong
@@ -772,18 +889,19 @@ impl<T: Transport> Network<T> {
     /// be redialed the moment a slot frees.
     fn enforce_eviction(&mut self, now: Duration) {
         loop {
-            let ready = self
-                .links
-                .values()
-                .filter(|entry| entry.up && entry.machine.state() == LinkState::Ready)
-                .count();
+            let held = |entry: &&Entry| {
+                entry.up
+                    && entry.machine.state() == LinkState::Ready
+                    && entry.class != LinkClass::Opportunistic
+            };
+            let ready = self.links.values().filter(held).count();
             if ready <= self.policy.target_stable {
                 return;
             }
             let worst = self
                 .links
                 .iter()
-                .filter(|(_, entry)| entry.up && entry.machine.state() == LinkState::Ready)
+                .filter(|(_, entry)| held(entry))
                 .filter(|(_, entry)| {
                     now.saturating_sub(entry.opened_at) >= self.policy.link_min_age
                 })
@@ -927,10 +1045,13 @@ mod tests {
     }
 
     /// Admission walks stable to the stable cap and then uses the
-    /// explore slot for the fifth link: the outbound explore pick
-    /// comes from the candidates, which never offer a peer that is
-    /// already linked, so all five links are to distinct peers and a
-    /// re-sighting of an existing neighbour never opens a sixth.
+    /// explore slot for the fifth link. A fifth peer new to the node is
+    /// first given the opportunistic slot (NET-22); once that link is
+    /// released and its cooldown has passed, the same peer comes back
+    /// through normal admission into the explore slot. The outbound
+    /// explore pick comes from the candidates, which never offer a peer
+    /// that is already linked, so all five links are to distinct peers
+    /// and a re-sighting of an existing neighbour never opens a sixth.
     #[test]
     fn admission_walks_stable_then_explore() {
         // Node 0 is the target: hint [3] sorts below P3 and P4, so it
@@ -951,6 +1072,15 @@ mod tests {
         let (na, np5) = (nets[0].transport().node(), nets[5].transport().node());
         world.set_in_range(na, np5, true);
         run(&world, &mut nets, Duration::from_secs(3));
+        let counts = nets[0].counts();
+        assert_eq!((counts.total, counts.opportunistic), (5, 1));
+        let p5 = nets[5].transport().peer_key();
+        let opportunistic = nets[0].links().into_iter().find(|info| info.peer == p5);
+        let now = world.now();
+        nets[0].release(now, opportunistic.expect("linked to P5").link);
+        // The cooldown holds P5 off, and then it is an ordinary candidate.
+        let cooldown = nets[0].policy.cooldown;
+        run(&world, &mut nets, cooldown + Duration::from_secs(3));
 
         let target = &nets[0];
         assert_eq!(target.links().len(), 5, "the explore slot opened");
@@ -966,6 +1096,81 @@ mod tests {
         peers.sort();
         peers.dedup();
         assert_eq!(peers.len(), 5, "every link is to a distinct peer");
+    }
+
+    /// An opportunistic link closed as the losing duplicate, while the
+    /// winning link to the same peer stays up, starts no cooldown: the
+    /// peer has not left. Run with the tags both ways round, so that in
+    /// one of them the losing link was already up when it lost.
+    #[test]
+    fn a_duplicate_opportunistic_link_starts_no_cooldown() {
+        let mut swapped = 0;
+        for tags in [[1u8, 2], [2, 1]] {
+            let world = SimWorld::new(SimConfig {
+                connect_jitter: Duration::ZERO,
+                ..SimConfig::default()
+            });
+            // Three links: a stable target of one, so one neighbour each
+            // puts A and B at their target and opens the opportunistic slot.
+            let config = NetworkConfig::default().with_max_links(3).unwrap();
+            let accepting = BeaconFlags {
+                accepting: true,
+                ..BeaconFlags::default()
+            };
+            // A and B have equal hints, so both dial each other after the
+            // delay; each has one neighbour with a higher hint.
+            let mut nets: Vec<Network<SimTransport>> =
+                [(tags[0], 7u8), (tags[1], 7), (3, 9), (4, 9)]
+                    .into_iter()
+                    .map(|(tag, hint)| {
+                        let radio = world.add_node(SimNode::default()).unwrap();
+                        let mut net = Network::new(config.clone(), radio);
+                        let app_hello = AppHello::new(Vec::new()).unwrap();
+                        net.set_local_hello(LocalTag::new([tag; 16]), app_hello);
+                        net.set_beacon([hint; 8], [0; 4], accepting);
+                        net
+                    })
+                    .collect();
+            let node = |i: usize, nets: &[Network<SimTransport>]| nets[i].transport().node();
+            world.set_in_range(node(0, &nets), node(2, &nets), true);
+            world.set_in_range(node(1, &nets), node(3, &nets), true);
+            run(&world, &mut nets, Duration::from_secs(2));
+
+            world.set_in_range(node(0, &nets), node(1, &nets), true);
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut events: [Vec<NetworkEvent>; 2] = [Vec::new(), Vec::new()];
+            for _ in 0..800 {
+                world.advance(Duration::from_millis(10));
+                for (i, net) in nets.iter_mut().enumerate() {
+                    while let Poll::Ready(event) = net.poll_event(&mut cx, world.now()) {
+                        if i < 2 {
+                            events[i].push(event);
+                        }
+                    }
+                }
+            }
+            // The higher tag's own opportunistic dial loses the tie-break.
+            let (loser, winner) = if tags[0] > tags[1] { (0, 1) } else { (1, 0) };
+            let peer = nets[winner].transport().peer_key();
+            let links = nets[loser].links();
+            let to_winner: Vec<&LinkInfo> = links.iter().filter(|l| l.peer == peer).collect();
+            assert_eq!(to_winner.len(), 1, "{links:?}");
+            assert_eq!(to_winner[0].role, LinkRole::Responder);
+            assert_eq!(nets[loser].cooldowns.tracked(), 0, "tags {tags:?}");
+            swapped += events[loser]
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        NetworkEvent::LinkDown {
+                            reason: DisconnectReason::Duplicate,
+                            ..
+                        }
+                    )
+                })
+                .count();
+        }
+        assert!(swapped > 0, "no up opportunistic link lost the tie-break");
     }
 
     /// Closing the losing duplicate leaves the peer linked: its table
