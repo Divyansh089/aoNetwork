@@ -2,7 +2,7 @@
 
 **The link layer of the aoheyra mesh.** A sans-IO Rust crate that turns a raw Bluetooth LE radio (or an in-memory simulator) into reliable, prioritised, abuse-resistant links between neighbouring phones.
 
-> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection), NET-19 (discovery modes), NET-21 (send-queue coalescing and expiry) and NET-22 (opportunistic links) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
+> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection), NET-19 (discovery modes), NET-20 (simulator scenario suite), NET-21 (send-queue coalescing and expiry) and NET-22 (opportunistic links) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
 
 Cargo package name: `ao_network` (the repo name keeps its capitals; the package is snake_case).
 
@@ -189,6 +189,9 @@ cargo bench                             # criterion benches in benches/
 # 3 simulated nodes exchanging data (after NET-12)
 cargo run --example sim_chat
 
+# The scenario suite on N seeded topologies instead of CI's fixed cases
+AO_SCENARIO_SEEDS=64 cargo test --release --test scenarios
+
 # Fuzzing (nightly toolchain): beacon_decode, frame_decode, reassembler_push.
 # New inputs land in the ignored fuzz/corpus; fuzz/seeds is checked in,
 # and each crash input is added there once fixed.
@@ -197,7 +200,7 @@ cargo +nightly fuzz run frame_decode fuzz/corpus/frame_decode fuzz/seeds/frame_d
 
 Tests are `cargo test` only: Miri runs in CI, and callgrind is opt-in profiling.
 
-CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A scheduled fuzzer runs every target every Sunday 00:00 IST (an equal share of 45 minutes within a 60-minute job), starting from the seeds checked in under `fuzz/seeds/`, and callgrind profiling runs on manual dispatch (`.github/workflows/`). A seeded simulator suite (< 2 min) and a longer nightly run arrive with NET-09.
+CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A scheduled fuzzer runs every target every Sunday 00:00 IST (an equal share of 45 minutes within a 60-minute job), starting from the seeds checked in under `fuzz/seeds/`, and callgrind profiling runs on manual dispatch (`.github/workflows/`). The scenario suite (`tests/scenarios.rs`) runs with `cargo test` on fixed cases of 5, 23 and 50 nodes, under 2 minutes; every night at 02:00 IST it runs on 512 seeded topologies of 5 to 50 nodes. It checks the degree cap on every tick, one link per pair after a simultaneous start, churn, partition and heal, full-node avoidance, eviction hysteresis and an abusive peer; a failure names the seed and size it replays from.
 
 ### Using sibling crates locally
 

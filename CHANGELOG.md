@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Simulator scenario suite (NET-20): `tests/scenarios.rs` runs the M3
+  invariants on seeded random topologies - the degree cap on every tick
+  under churn, one link per pair after a simultaneous start, partition
+  and heal, full-node avoidance, eviction hysteresis and an abusive
+  peer, each settling to a mesh where no pair in range is left unlinked
+  while both ends advertise room. CI runs fixed cases of 5, 23 and 50
+  nodes; `AO_SCENARIO_SEEDS=N` runs N seeded ones, and a nightly
+  workflow runs 512 in release mode.
 - Opportunistic links (NET-22): once a node holds its stable target, a
   peer whose beacon digest is new to it (a first sighting included, so a
   node passing by) is dialed into the single opportunistic slot, ahead of
