@@ -27,14 +27,15 @@ use std::future::{Future, poll_fn};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::guard::AbuseGuard;
 use crate::topology::{
     ClassCounts, LinkClass, PeerTable, ReadyLink, TopologyPolicy, duplicate_loser,
 };
 use crate::{
     AdvProfile, AppHello, Beacon, BeaconFlags, Channel, ConnectError, DisconnectReason,
-    FRAME_VERSION, Hello, Link, LinkAction, LinkEnd, LinkId, LinkMetrics, LinkRole, LinkState,
-    LocalTag, NetworkConfig, PeerKey, PowerMode, RadioState, ScanProfile, SendError, SendOpts,
-    Transport, TransportEvent,
+    FRAME_VERSION, HandshakeFailure, Hello, Link, LinkAction, LinkEnd, LinkId, LinkMetrics,
+    LinkRole, LinkState, LocalTag, NetworkConfig, PeerKey, PowerMode, RadioState, ScanProfile,
+    SendError, SendOpts, Transport, TransportEvent,
 };
 
 /// Something the layer above must know about.
@@ -131,6 +132,15 @@ struct Entry {
 /// is kept and the other closed with [`DisconnectReason::Duplicate`]. A
 /// link whose remote tag is this node's own is closed the same way.
 ///
+/// Every peer is treated as hostile. A peer that sends faster than the
+/// configured frame or byte limit is disconnected with
+/// [`DisconnectReason::AbuseDetected`] and blacklisted at once. A link
+/// closed for a malformed frame, a broken chunk stream or an oversize
+/// `Hello` is a strike against its peer, and `max_strikes` strikes
+/// blacklist it too. A blacklisted peer is never dialed, its inbound
+/// links are refused, and any link still open to it is closed, until
+/// `blacklist_duration` has passed.
+///
 /// # Example
 ///
 /// ```
@@ -186,6 +196,8 @@ pub struct Network<T> {
     table: PeerTable,
     /// The slots, scores and eviction rules links are admitted under.
     policy: TopologyPolicy,
+    /// Strikes and the blacklist.
+    guard: AbuseGuard,
     events: VecDeque<NetworkEvent>,
 }
 
@@ -195,6 +207,7 @@ impl<T: Transport> Network<T> {
         transport.start();
         let table = PeerTable::new(&config);
         let policy = TopologyPolicy::new(&config);
+        let guard = AbuseGuard::new(&config);
         Self {
             config,
             transport,
@@ -206,6 +219,7 @@ impl<T: Transport> Network<T> {
             peers: BTreeMap::new(),
             table,
             policy,
+            guard,
             events: VecDeque::new(),
         }
     }
@@ -434,7 +448,7 @@ impl<T: Transport> Network<T> {
         let Some(class) = self.policy.admit(&self.counts()) else {
             return;
         };
-        if !self.table.eligible(&peer, now, &self.peers) {
+        if !self.table.eligible(&peer, now, &self.peers) || self.guard.is_blocked(&peer, now) {
             return;
         }
         let Some(hint) = self.table.hint_of(&peer) else {
@@ -461,6 +475,8 @@ impl<T: Transport> Network<T> {
     /// connections run their handshakes and the duplicate tie-break
     /// keeps one. Refusing would leave the two ends each refusing the
     /// other's connection.
+    ///
+    /// A blacklisted peer is refused.
     fn accept(&mut self, now: Duration, link: LinkId, peer: PeerKey) -> bool {
         let Some(hello) = &self.hello else {
             return false;
@@ -469,7 +485,9 @@ impl<T: Transport> Network<T> {
             return false;
         };
         let held = self.peers.get(&peer).and_then(|held| self.links.get(held));
-        if held.is_some_and(|held| held.up || held.role == LinkRole::Responder) {
+        if held.is_some_and(|held| held.up || held.role == LinkRole::Responder)
+            || self.guard.is_blocked(&peer, now)
+        {
             return false;
         }
         if self
@@ -627,6 +645,9 @@ impl<T: Transport> Network<T> {
             self.events
                 .push_back(NetworkEvent::LinkDown { link, reason });
         }
+        if let LinkEnd::Disconnected(reason) = end {
+            self.judge(now, entry.peer, reason);
+        }
         self.apply_profiles();
         // A slot just freed: dial the next candidate now rather than
         // waiting for a sighting to say the neighbourhood changed.
@@ -656,6 +677,36 @@ impl<T: Transport> Network<T> {
                 && other_entry.machine.state() == LinkState::Ready
         })?;
         duplicate_loser(&ready(held, held_entry), &ready(link, entry))
+    }
+
+    /// Holds a link that ended for `reason` against its `peer`: a flood
+    /// blacklists the peer at once, misbehaviour is a strike, anything
+    /// else is not the peer's fault. A newly blacklisted peer loses every
+    /// other link it holds here.
+    fn judge(&mut self, now: Duration, peer: PeerKey, reason: DisconnectReason) {
+        let blocked = match reason {
+            DisconnectReason::AbuseDetected => {
+                self.guard.block(now, peer);
+                true
+            }
+            DisconnectReason::ProtocolViolation
+            | DisconnectReason::HandshakeFailed(HandshakeFailure::OversizeHello) => {
+                self.guard.strike(now, peer)
+            }
+            _ => false,
+        };
+        if !blocked {
+            return;
+        }
+        let held: Vec<LinkId> = self
+            .links
+            .iter()
+            .filter(|(_, entry)| entry.peer == peer)
+            .map(|(&link, _)| link)
+            .collect();
+        for link in held {
+            self.disconnect(now, link, DisconnectReason::AbuseDetected);
+        }
     }
 
     /// Sheds the worst link while the node holds more healthy links
@@ -880,6 +931,51 @@ mod tests {
             assert_eq!(net.peers.get(&peer), Some(&info.link));
             assert_eq!(net.table.state(&peer), Some(PeerState::Linked));
         }
+    }
+
+    /// A peer blacklisted over one link loses every other link it holds
+    /// here, and is then neither redialed nor accepted. Strikes below the
+    /// limit and ordinary endings leave its link alone.
+    #[test]
+    fn a_blacklisted_peer_loses_its_other_links() {
+        let radios = vec![SimNode::default(); 2];
+        let (world, mut nets) = world_with(&radios, &[[1; 8], [2; 8]], &[(0, 1)]);
+        run(&world, &mut nets, Duration::from_secs(2));
+        let peer = nets[1].transport().peer_key();
+        assert_eq!(nets[0].links().len(), 1);
+
+        let now = world.now();
+        nets[0].judge(now, peer, DisconnectReason::KeepaliveTimeout);
+        nets[0].judge(now, peer, DisconnectReason::ProtocolViolation);
+        nets[0].judge(now, peer, DisconnectReason::ProtocolViolation);
+        assert_eq!(nets[0].links().len(), 1, "two strikes are not a block");
+
+        // As if a second link to the same peer had ended in a flood.
+        nets[0].judge(now, peer, DisconnectReason::AbuseDetected);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut downs = Vec::new();
+        for _ in 0..100 {
+            world.advance(Duration::from_millis(10));
+            while let Poll::Ready(event) = nets[0].poll_event(&mut cx, world.now()) {
+                downs.push(event);
+            }
+            settle(&world, &mut nets[1..]);
+        }
+        assert!(
+            matches!(
+                downs[..],
+                [NetworkEvent::LinkDown {
+                    reason: DisconnectReason::AbuseDetected,
+                    ..
+                }]
+            ),
+            "{downs:?}"
+        );
+        // Sightings keep coming both ways: node 0 does not dial the
+        // blocked peer, and the peer's own delayed dial is refused.
+        run(&world, &mut nets, Duration::from_secs(10));
+        assert!(nets[0].links().is_empty());
+        assert!(nets[0].links.is_empty(), "not even a connecting entry");
     }
 
     /// Three rejected outbound attempts in a row lower the session's

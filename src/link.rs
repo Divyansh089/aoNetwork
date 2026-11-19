@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::codec::data_frame_len;
+use crate::guard::TokenBucket;
 use crate::{
     Channel, ConnectError, DisconnectReason, Fragmenter, Frame, FrameError, HandshakeFailure,
     Hello, LinkMetrics, MAX_MTU, MIN_MTU, NetworkConfig, Reassembler, SendError, SendOpts,
@@ -77,7 +78,9 @@ pub enum LinkEnd {
 /// link is ready. Payloads still queued when the link closes are discarded
 /// with it. A peer frame other than `Hello` before the
 /// handshake, a malformed frame or a broken chunk stream closes the link
-/// with [`DisconnectReason::ProtocolViolation`].
+/// with [`DisconnectReason::ProtocolViolation`]. A peer that sends more
+/// frames or bytes than the configured limits allow closes it with
+/// [`DisconnectReason::AbuseDetected`].
 #[derive(Debug)]
 pub struct Link {
     local: Hello,
@@ -104,6 +107,10 @@ pub struct Link {
     /// Pings in a row that went unanswered while nothing arrived.
     missed_pongs: u8,
     metrics: LinkMetrics,
+    /// Meters the peer's frames, each counted once reassembled.
+    frames_in: TokenBucket,
+    /// Meters the peer's bytes, counted per received chunk.
+    bytes_in: TokenBucket,
 }
 
 impl Link {
@@ -130,6 +137,10 @@ impl Link {
             ping_sent_at: None,
             missed_pongs: 0,
             metrics: LinkMetrics::default(),
+            // Full from the start, so the time they were made at
+            // does not matter.
+            frames_in: TokenBucket::new(config.frame_limit(), Duration::ZERO),
+            bytes_in: TokenBucket::new(config.byte_limit(), Duration::ZERO),
         }
     }
 
@@ -332,11 +343,19 @@ impl Link {
         if self.state == LinkState::Closing {
             return;
         }
+        let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        if !self.bytes_in.take(now, len) {
+            return self.fail(DisconnectReason::AbuseDetected, out);
+        }
         let bytes = match self.reassembler.push(now, chunk) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return,
             Err(_) => return self.fail(DisconnectReason::ProtocolViolation, out),
         };
+        // Counted before decoding, so malformed frames count too.
+        if !self.frames_in.take(now, 1) {
+            return self.fail(DisconnectReason::AbuseDetected, out);
+        }
         let frame = match Frame::decode(&bytes, self.max_frame) {
             Ok(frame) => frame,
             Err(FrameError::AppHelloTooLong { .. }) if self.state == LinkState::Handshaking => {

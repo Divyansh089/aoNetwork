@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Inbound abuse protection (NET-18): each link meters what its peer
+  sends with token buckets for frames and bytes (`frame_limit`, default
+  50/s with a burst of 200, and `byte_limit`, default 64 KiB/s with a
+  burst of 256 KiB, configured with the new `RateLimit`). A peer over
+  either limit is disconnected with `DisconnectReason::AbuseDetected`
+  and blacklisted at once. A link closed for a malformed frame, a
+  broken chunk stream or an oversize `Hello` is a strike against its
+  peer, and `max_strikes` (default 3) strikes blacklist it. A
+  blacklisted peer is neither dialed nor accepted, and loses any other
+  link, for `blacklist_duration` (default 10 min), which is also how
+  long a strike is remembered. Strikes and the blacklist are kept per
+  `PeerKey`, bounded by `max_peers`.
 - Duplicate-link resolution (NET-17): the side of a pair whose beacon
   hint sorts higher (or equal) now dials after a 4 s initiation delay
   instead of never, so pairs with equal hints, or whose lower side

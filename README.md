@@ -2,7 +2,7 @@
 
 **The link layer of the aoheyra mesh.** A sans-IO Rust crate that turns a raw Bluetooth LE radio (or an in-memory simulator) into reliable, prioritised, abuse-resistant links between neighbouring phones.
 
-> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution) and NET-21 (send-queue coalescing and expiry) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
+> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection) and NET-21 (send-queue coalescing and expiry) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
 
 Cargo package name: `ao_network` (the repo name keeps its capitals; the package is snake_case).
 
@@ -33,7 +33,7 @@ aoNetwork knows about **radio peers and frames**. It does not know what a messag
 - Enforces the **degree cap** (how many links a phone keeps): admission fills stable slots up to `max_stable` (the stable target plus one) and then the single explore slot, candidates are scored by signal and by the peer's degree so the best neighbour is dialled first, a node over its target sheds its weakest degraded link (below `min_rssi` and past a 10 s minimum age) while strong links are kept, inbound links meet the same slots and floor, and three rejected attempts in a row lower the session's cap. With no slot free the node stops advertising `accepting`, so nobody dials it into a full table. The opportunistic slot is reserved for NET-22.
 - Keeps **one link per neighbour**: of each pair, the side whose beacon hint sorts lower dials at once and the other waits 4 s first. If both connections still complete their handshakes, the one opened by the lower link tag is kept and the other closed with `Duplicate`; a peer presenting this node's own tag is dropped the same way.
 - Detects dead links (**keepalive**) and tracks per-link metrics (RSSI, RTT, bytes, drops).
-- Protects itself from hostile neighbours with **per-link rate limits, strikes and a temporary blacklist**. Every neighbour is treated as hostile.
+- Protects itself from hostile neighbours with **per-link rate limits, strikes and a temporary blacklist**. Every neighbour is treated as hostile: a peer that sends more frames or bytes than its link allows is disconnected with `AbuseDetected` and blacklisted, and malformed frames, broken chunk streams and oversize `Hello`s are strikes, three of which blacklist the peer too. A blacklisted peer is neither dialled nor accepted until its entry expires.
 - Exposes a single sans-IO façade (`Network`) that the caller polls from its own async task, and a **native contract** (`NativeSink`) that the Kotlin BLE module implements.
 
 ## What it deliberately does not do
@@ -117,6 +117,8 @@ and scanning are separate work.
 | Keepalive | ping after 15 s with nothing received, then every 15 s until a pong; 3 missed pongs close the link (a silent peer is closed within 60 s) |
 | `max_frame` | 16 KiB |
 | Send-queue cap | 128 KiB per link, split Control 16, Message 48, Telemetry 16, Bulk 48 KiB |
+| Inbound rate limit | 50 frames/s (burst 200) and 64 KiB/s (burst 256 KiB) per link |
+| Strikes | 3 strikes blacklist a peer; blacklist and strike memory last 10 min |
 
 These may change after the BLE spike (AND-02). Source of truth is `NetworkConfig`, not this table.
 
