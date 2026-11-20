@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Benchmarks and memory budget (NET-24): criterion benches for the frame
+  and beacon codecs, the send queue, and fragmentation and reassembly,
+  and an `instructions` bench that runs the same workloads under
+  Callgrind; CI compares their instruction counts between base and head
+  on every PR and fails above +5%. `tests/memory_budget.rs` measures a
+  fully loaded node and fails above the ceilings in the README.
+  Behaviour changes: each queued payload now also counts
+  `SendQueue::ENTRY_COST` (64 B) against its channel cap, so a cap bounds
+  the memory it holds (a queue of empty payloads used to hold about 20
+  times its cap), and the minimum channel cap rises from 64 to 128 B. A
+  payload's spare capacity is released when it is queued, the
+  reassembly buffer never grows past `max_frame`, and `NativeTransport`
+  closes a link given an `on_bytes` value longer than 514 bytes with
+  `TransportLost`.
 - Observability (NET-23): each link logs its lifecycle (opened, up,
   duplicate, evicted, dwell over, down with its reason, connect failed)
   through `tracing` under a `link{id peer role class}` span, and strikes,
