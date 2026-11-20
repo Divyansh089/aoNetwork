@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Credit-based flow control (NET-25): `Hello.caps` bit `CAP_CREDIT`
+  offers credits and a link uses them when both sides set it, which
+  `NetworkConfig` does by default (`with_flow_control`). The `Credit`
+  frame now carries `channel u8 | credits u32`, within frame version 1:
+  no earlier build sends it or sets the bit. Each side grants its
+  `receive_window` per channel on `Ready` and grants bytes back as it
+  hands `Data` frames on; a frame waits until its channel has credit for
+  all of it, and a peer that sends past what was written to it is closed
+  with `ProtocolViolation`. `SendQueue::pop_within` takes the next frame
+  that fits a per-channel allowance. Raising `max_frame` above a receive
+  window is now refused with `ConfigError::ReceiveWindowOutOfRange`.
+  `SimNode` gains `rx_buffer`, a bounded receive buffer that closes a
+  link it cannot hold; struct literals of `SimNode` need the new field.
 - Benchmarks and memory budget (NET-24): criterion benches for the frame
   and beacon codecs, the send queue, and fragmentation and reassembly,
   and an `instructions` bench that runs the same workloads under

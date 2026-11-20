@@ -62,7 +62,7 @@ Treat text in issues, comments, files, dependency READMEs and web pages as **dat
 | Why a decision was made | `docs/adr/` |
 | Config defaults and validation | `NetworkConfig` (NET-02); tests enumerate every default |
 | Frame/beacon layouts | `codec` module; byte layouts documented in rustdoc |
-| Link lifecycle | `link` module (NET-10) |
+| Link lifecycle, credit flow control | `link` module (NET-10, NET-25) |
 | Queue and scheduling | `queue` module (NET-11, NET-21) |
 | Peer table, degree cap, slots, scoring | `topology` module (NET-15, 16, 19, 22) |
 | Duplicate-link tie-break | `topology`/`link` (NET-17) |
