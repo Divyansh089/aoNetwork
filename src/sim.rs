@@ -68,6 +68,11 @@ pub struct SimNode {
     /// Signal strength other nodes report when they hear it advertise,
     /// as `Discovered` RSSI.
     pub rssi: i16,
+    /// Most bytes of received chunks it holds before they are polled,
+    /// over all its links, or `None` for no limit. A chunk that does not
+    /// fit is dropped and its link closed with `TransportLost`, as a
+    /// phone's overflowing receive queue would.
+    pub rx_buffer: Option<usize>,
 }
 
 impl Default for SimNode {
@@ -77,6 +82,7 @@ impl Default for SimNode {
             max_links: 7,
             can_advertise: true,
             rssi: SIM_RSSI,
+            rx_buffer: None,
         }
     }
 }
@@ -263,7 +269,12 @@ impl Transport for SimTransport {
         with_world(&self.world, |w| {
             let node = &mut w.nodes[self.node.0];
             match node.events.pop_front() {
-                Some(event) => Poll::Ready(event),
+                Some(event) => {
+                    if let TransportEvent::Received { chunk, .. } = &event {
+                        node.rx_held -= chunk.len();
+                    }
+                    Poll::Ready(event)
+                }
                 None => {
                     node.waker = Some(cx.waker().clone());
                     Poll::Pending
@@ -337,6 +348,8 @@ struct NodeState {
     next_link: u64,
     links: BTreeMap<LinkId, Link>,
     events: VecDeque<TransportEvent>,
+    /// Bytes of `Received` chunks in `events`.
+    rx_held: usize,
     waker: Option<Waker>,
 }
 
@@ -380,6 +393,7 @@ impl World {
             next_link: 0,
             links: BTreeMap::new(),
             events: VecDeque::new(),
+            rx_held: 0,
             waker: None,
         });
         NodeId(self.nodes.len() - 1)
@@ -751,8 +765,16 @@ impl World {
     }
 
     fn finish_write(&mut self, from: (NodeId, LinkId), to: (NodeId, LinkId), chunk: Vec<u8>) {
-        if self.nodes[to.0.0].links.contains_key(&to.1) {
-            self.emit(to.0, TransportEvent::Received { link: to.1, chunk });
+        let receiver = &self.nodes[to.0.0];
+        if receiver.links.contains_key(&to.1) {
+            let held = receiver.rx_held + chunk.len();
+            if receiver.config.rx_buffer.is_some_and(|limit| held > limit) {
+                // Closes the sender's end too, so no `WriteReady` follows.
+                self.kill_link(to.0, to.1);
+            } else {
+                self.nodes[to.0.0].rx_held = held;
+                self.emit(to.0, TransportEvent::Received { link: to.1, chunk });
+            }
         }
         if let Some(Link {
             state: LinkState::Up { can_write, .. },

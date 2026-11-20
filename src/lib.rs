@@ -70,8 +70,8 @@ mod transport;
 mod types;
 
 pub use codec::{
-    AppHello, BEACON_LEN, BEACON_VERSION, Beacon, BeaconFlags, FRAME_VERSION, Fragmenter, Frame,
-    Hello, MAX_APP_HELLO, MAX_MTU, MIN_MTU, Reassembler,
+    AppHello, BEACON_LEN, BEACON_VERSION, Beacon, BeaconFlags, CAP_CREDIT, FRAME_VERSION,
+    Fragmenter, Frame, Hello, MAX_APP_HELLO, MAX_MTU, MIN_MTU, Reassembler,
 };
 pub use config::NetworkConfig;
 pub use discovery::DiscoveryMode;

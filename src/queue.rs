@@ -248,25 +248,41 @@ impl SendQueue {
     /// Takes the next payload to send at `now`, if any, after dropping
     /// every frame whose deadline has passed.
     pub fn pop(&mut self, now: Duration) -> Option<(Channel, Vec<u8>)> {
+        self.pop_within(now, |_| usize::MAX)
+    }
+
+    /// [`pop`](Self::pop), taking only a payload whose encoded `Data`
+    /// frame fits `allowance` of its channel: the credit a flow-controlled
+    /// peer has granted. A channel whose next frame does not fit waits,
+    /// as an empty channel would, while the others go on.
+    pub fn pop_within(
+        &mut self,
+        now: Duration,
+        allowance: impl Fn(Channel) -> usize,
+    ) -> Option<(Channel, Vec<u8>)> {
         self.prune(now);
-        if let Some(payload) = self.take(Channel::Control) {
+        let fits = |queue: &Self, channel: Channel| {
+            queue.entries[channel.index()]
+                .front()
+                .is_some_and(|e| data_frame_len(e.payload.len()) <= allowance(channel))
+        };
+        if fits(self, Channel::Control) {
+            let payload = self.take(Channel::Control)?;
             return Some((Channel::Control, payload));
         }
-        if DRR
-            .iter()
-            .all(|(channel, _)| self.entries[channel.index()].is_empty())
-        {
+        if !DRR.iter().any(|&(channel, _)| fits(self, channel)) {
             return None;
         }
-        // Terminates: some channel is non-empty and gains a quantum every
-        // round until its head fits.
+        // Terminates: some channel's head fits its allowance, and that
+        // channel gains a quantum every round until the head fits it too.
         loop {
             let (channel, weight) = DRR[self.turn];
             let i = channel.index();
-            match self.entries[i]
+            let head = self.entries[i]
                 .front()
                 .map(|e| data_frame_len(e.payload.len()))
-            {
+                .filter(|&cost| cost <= allowance(channel));
+            match head {
                 Some(cost) if cost <= self.deficit[i] => {
                     self.deficit[i] -= cost;
                     let payload = self.take(channel)?;
@@ -281,7 +297,7 @@ impl SendQueue {
                     continue;
                 }
                 Some(_) => {}
-                // An idle channel does not bank deficit.
+                // An idle or waiting channel does not bank deficit.
                 None => self.deficit[i] = 0,
             }
             self.turn = (self.turn + 1) % DRR.len();

@@ -54,14 +54,30 @@ fn bodiless_frames_and_credit_match_their_fixtures() {
         (Frame::Bye, &[1, 0x05]),
         (
             Frame::Credit {
+                channel: Channel::Bulk,
                 credits: 0x0A0B_0C0D,
             },
-            &[1, 0x06, 0x0A, 0x0B, 0x0C, 0x0D],
+            &[1, 0x06, 0x03, 0x0A, 0x0B, 0x0C, 0x0D],
         ),
     ];
     for (frame, wire) in cases {
         assert_eq!(frame.encode(), wire, "{frame:?}");
     }
+}
+
+/// NET-25: `Credit` names its channel. An unknown channel byte is
+/// refused like `Data`'s, and the reserved body without a channel, which
+/// no build ever sent, no longer decodes.
+#[test]
+fn credit_carries_a_known_channel() {
+    assert_eq!(
+        Frame::decode(&[1, 0x06, 0x04, 0, 0, 0, 1], 64),
+        Err(FrameError::UnknownChannel { channel: 4 })
+    );
+    assert_eq!(
+        Frame::decode(&[1, 0x06, 0, 0, 0, 1], 64),
+        Err(FrameError::Truncated)
+    );
 }
 
 #[test]

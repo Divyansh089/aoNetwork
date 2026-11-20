@@ -345,3 +345,46 @@ fn ten_node_scenario_is_reproducible() {
     // The seed matters: other jitter, other timeline.
     assert_ne!(first, ten_node_run(8));
 }
+
+/// A bounded receive buffer holds received chunks until they are polled;
+/// polling frees it, and a chunk that does not fit is dropped and its link
+/// closed with `TransportLost` at both ends.
+#[test]
+fn a_full_receive_buffer_closes_the_link() {
+    let world = SimWorld::new(SimConfig::default());
+    let small = SimNode {
+        rx_buffer: Some(50),
+        ..SimNode::default()
+    };
+    let (mut a, mut b) = pair(&world, SimNode::default(), small);
+    let (link, remote) = connected(&world, &mut a, &mut b);
+    let received = |byte| TransportEvent::Received {
+        link: remote,
+        chunk: vec![byte; 20],
+    };
+
+    for byte in 0..2u8 {
+        a.write(link, vec![byte; 20]);
+        world.advance(SECOND);
+        drain(&mut a);
+    }
+    // Polled: the 40 bytes held are freed, so two more fit.
+    assert_eq!(drain(&mut b), [received(0), received(1)]);
+    for byte in 2..5u8 {
+        a.write(link, vec![byte; 20]);
+        world.advance(SECOND);
+    }
+    let lost = |link| TransportEvent::Disconnected {
+        link,
+        reason: DisconnectReason::TransportLost,
+    };
+    assert_eq!(
+        drain(&mut a),
+        [
+            TransportEvent::WriteReady { link },
+            TransportEvent::WriteReady { link },
+            lost(link)
+        ]
+    );
+    assert_eq!(drain(&mut b), [received(2), received(3), lost(remote)]);
+}

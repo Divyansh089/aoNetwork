@@ -9,11 +9,12 @@
 //! Ping    0x03  (empty)
 //! Pong    0x04  (empty)
 //! Bye     0x05  (empty)
-//! Credit  0x06  credits u32
+//! Credit  0x06  channel u8 | credits u32
 //! ```
 //!
 //! Integers are big-endian; lengths are canonical LEB128. The rules are
-//! recorded in `docs/adr/net-04-frame-wire-format.md`.
+//! recorded in `docs/adr/net-04-frame-wire-format.md`, and the `Credit`
+//! body in `docs/adr/net-25-credit-flow-control.md`.
 
 use super::varint;
 use crate::{Channel, FrameError, LocalTag};
@@ -24,6 +25,10 @@ pub const FRAME_VERSION: u8 = 1;
 
 /// Largest `app_hello` blob a [`Hello`] may carry, in bytes.
 pub const MAX_APP_HELLO: usize = 256;
+
+/// [`Hello::caps`] bit: the sender takes part in credit-based flow
+/// control. A link uses credits only when both `Hello`s set it.
+pub const CAP_CREDIT: u32 = 1;
 
 const TYPE_HELLO: u8 = 0x01;
 const TYPE_DATA: u8 = 0x02;
@@ -136,9 +141,12 @@ pub enum Frame {
     Pong,
     /// Orderly close.
     Bye,
-    /// Reserved for credit-based flow control (NET-25).
+    /// Flow control: the receiver lets the peer send `credits` more
+    /// bytes of `Data` frames on `channel`, counted as encoded.
     Credit {
-        /// Credits granted to the peer.
+        /// The channel the credits are for.
+        channel: Channel,
+        /// Bytes granted.
         credits: u32,
     },
 }
@@ -169,8 +177,9 @@ impl Frame {
             Self::Ping => out.push(TYPE_PING),
             Self::Pong => out.push(TYPE_PONG),
             Self::Bye => out.push(TYPE_BYE),
-            Self::Credit { credits } => {
+            Self::Credit { channel, credits } => {
                 out.push(TYPE_CREDIT);
+                out.push(channel_to_wire(*channel));
                 out.extend_from_slice(&credits.to_be_bytes());
             }
         }
@@ -213,6 +222,7 @@ impl Frame {
             TYPE_PONG => Self::Pong,
             TYPE_BYE => Self::Bye,
             TYPE_CREDIT => Self::Credit {
+                channel: channel_from_wire(reader.u8()?)?,
                 credits: reader.u32()?,
             },
             frame_type => return Err(FrameError::UnknownType { frame_type }),
@@ -229,7 +239,7 @@ impl Frame {
             }
             Self::Data { payload, .. } => return data_frame_len(payload.len()),
             Self::Ping | Self::Pong | Self::Bye => 0,
-            Self::Credit { .. } => 4,
+            Self::Credit { .. } => 1 + 4,
         };
         HEADER_LEN + body
     }

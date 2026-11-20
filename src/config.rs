@@ -23,6 +23,8 @@ const MAX_FRAME: usize = 1024 * 1024;
 const MAX_QUEUE_CAP: usize = 1024 * 1024;
 // One smallest frame and the slot it is queued in.
 const MIN_CHANNEL_CAP: usize = MIN_FRAME + SendQueue::ENTRY_COST;
+// A peer's grant fits a credit's `u32`, and bounds what a link holds unread.
+const MAX_RECEIVE_WINDOW: usize = 1024 * 1024;
 // Both parts of a rate limit; the bucket arithmetic stays far from overflow.
 const MAX_RATE: u32 = 16 * 1024 * 1024;
 const MIN_FRAME_BURST: u32 = 1;
@@ -55,6 +57,10 @@ const DEFAULT_BYTE_LIMIT: RateLimit = RateLimit {
 const DEFAULT_MAX_STRIKES: u8 = 3;
 const DEFAULT_BLACKLIST_DURATION: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
+// What a peer may have in flight to us per channel: as much as our own
+// send queue holds on that channel.
+const DEFAULT_RECEIVE_WINDOWS: [usize; 4] = DEFAULT_CHANNEL_CAPS;
+const DEFAULT_FLOW_CONTROL: bool = true;
 
 /// Link-layer configuration with validated defaults.
 ///
@@ -75,6 +81,8 @@ const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 /// | `max_strikes` | 3 | >= 1 |
 /// | `blacklist_duration` | 10 min | > 0 |
 /// | `discovery_interval` | 10 s | > 0 |
+/// | `flow_control` | on | - |
+/// | `receive_window` | Control 16, Message 48, Telemetry 16, Bulk 48 KiB | each `max_frame`..=1 MiB |
 ///
 /// Start from [`Default`] and chain the setters; each returns
 /// `Result<Self, ConfigError>` and validates the **whole** configuration, so
@@ -116,6 +124,8 @@ pub struct NetworkConfig {
     max_strikes: u8,
     blacklist_duration: Duration,
     discovery_interval: Duration,
+    flow_control: bool,
+    receive_windows: [usize; 4],
 }
 
 impl NetworkConfig {
@@ -217,6 +227,19 @@ impl NetworkConfig {
         }
         if self.discovery_interval.is_zero() {
             return Err(ConfigError::DiscoveryIntervalZero);
+        }
+        // A window below `max_frame` could never admit the largest frame
+        // the peer is allowed to send, and the channel would stall.
+        for channel in Channel::ALL {
+            let value = self.receive_windows[channel.index()];
+            if !(self.max_frame..=MAX_RECEIVE_WINDOW).contains(&value) {
+                return Err(ConfigError::ReceiveWindowOutOfRange {
+                    channel,
+                    value,
+                    min: self.max_frame,
+                    max: MAX_RECEIVE_WINDOW,
+                });
+            }
         }
         Ok(())
     }
@@ -405,6 +428,34 @@ impl NetworkConfig {
         Ok(self)
     }
 
+    /// Sets whether this node offers credit-based flow control (default:
+    /// on). A link uses it only when both `Hello`s set
+    /// [`CAP_CREDIT`](crate::CAP_CREDIT); otherwise only the send-queue
+    /// caps limit what a peer is sent.
+    pub fn with_flow_control(mut self, on: bool) -> Result<Self, ConfigError> {
+        self.flow_control = on;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Sets how many bytes of `Data` frames on `channel` a peer may have
+    /// sent but this node not yet processed, on each link with flow
+    /// control (default: the channel's default send-queue cap).
+    ///
+    /// Must be in `max_frame..=1 MiB`, so the largest frame the peer may
+    /// send always fits; raise the windows before `max_frame`. A peer
+    /// that sends past its window is closed with
+    /// [`DisconnectReason::ProtocolViolation`](crate::DisconnectReason::ProtocolViolation).
+    pub fn with_receive_window(
+        mut self,
+        channel: Channel,
+        window: usize,
+    ) -> Result<Self, ConfigError> {
+        self.receive_windows[channel.index()] = window;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// The degree cap: how many links this node keeps at once.
     pub fn max_links(&self) -> u32 {
         self.max_links
@@ -482,6 +533,17 @@ impl NetworkConfig {
     pub fn discovery_interval(&self) -> Duration {
         self.discovery_interval
     }
+
+    /// Whether this node offers credit-based flow control.
+    pub fn flow_control(&self) -> bool {
+        self.flow_control
+    }
+
+    /// How many unprocessed bytes of `Data` frames on `channel` a peer
+    /// may have in flight on a flow-controlled link.
+    pub fn receive_window(&self, channel: Channel) -> usize {
+        self.receive_windows[channel.index()]
+    }
 }
 
 /// Whether `limit` has a rate in `1..=MAX_RATE` and a burst in
@@ -510,6 +572,8 @@ impl Default for NetworkConfig {
             max_strikes: DEFAULT_MAX_STRIKES,
             blacklist_duration: DEFAULT_BLACKLIST_DURATION,
             discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
+            flow_control: DEFAULT_FLOW_CONTROL,
+            receive_windows: DEFAULT_RECEIVE_WINDOWS,
         }
     }
 }
@@ -548,6 +612,43 @@ mod tests {
         assert_eq!(cfg.max_strikes(), 3);
         assert_eq!(cfg.blacklist_duration(), Duration::from_secs(600));
         assert_eq!(cfg.discovery_interval(), Duration::from_secs(10));
+        assert!(cfg.flow_control());
+        assert_eq!(cfg.receive_window(Channel::Control), 16 * 1024);
+        assert_eq!(cfg.receive_window(Channel::Message), 48 * 1024);
+        assert_eq!(cfg.receive_window(Channel::Telemetry), 16 * 1024);
+        assert_eq!(cfg.receive_window(Channel::Bulk), 48 * 1024);
+    }
+
+    #[test]
+    fn a_receive_window_must_fit_one_frame_and_stay_bounded() {
+        let base = NetworkConfig::default();
+        let too_small = base
+            .clone()
+            .with_receive_window(Channel::Bulk, 16 * 1024 - 1)
+            .unwrap_err();
+        assert_eq!(
+            too_small,
+            ConfigError::ReceiveWindowOutOfRange {
+                channel: Channel::Bulk,
+                value: 16 * 1024 - 1,
+                min: 16 * 1024,
+                max: 1024 * 1024,
+            }
+        );
+        assert!(matches!(
+            base.clone().with_receive_window(Channel::Message, 1024 * 1024 + 1),
+            Err(ConfigError::ReceiveWindowOutOfRange { value, .. }) if value == 1024 * 1024 + 1
+        ));
+        // Raising max_frame past a window is refused until the window grows.
+        assert!(matches!(
+            base.clone().with_max_frame(32 * 1024),
+            Err(ConfigError::ReceiveWindowOutOfRange {
+                channel: Channel::Control,
+                ..
+            })
+        ));
+        let lowered = base.with_flow_control(false).unwrap();
+        assert!(!lowered.flow_control());
     }
 
     #[test]
@@ -783,10 +884,11 @@ mod tests {
             }
         );
         assert_eq!(base.clone().with_max_frame(64).unwrap().max_frame(), 64);
-        // The 1 MiB ceiling is reachable only after the queue cap can hold
-        // that frame (queue_cap >= max_frame).
+        // The 1 MiB ceiling is reachable only after the queue cap and the
+        // receive windows can hold that frame.
         assert_eq!(
-            base.with_queue_cap(1024 * 1024)
+            windows(&base, 1024 * 1024)
+                .with_queue_cap(1024 * 1024)
                 .unwrap()
                 .with_max_frame(1024 * 1024)
                 .unwrap()
@@ -825,7 +927,10 @@ mod tests {
             }
         );
         assert_eq!(
-            base.with_max_frame(128 * 1024).unwrap().max_frame(),
+            windows(&base, 128 * 1024)
+                .with_max_frame(128 * 1024)
+                .unwrap()
+                .max_frame(),
             128 * 1024
         );
     }
@@ -878,6 +983,13 @@ mod tests {
         assert_eq!(cfg.channel_cap(Channel::Message), 16 * 1024);
         assert_eq!(cfg.channel_cap(Channel::Bulk), 16 * 1024);
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    /// `base` with every channel's receive window at `window`.
+    fn windows(base: &NetworkConfig, window: usize) -> NetworkConfig {
+        Channel::ALL.into_iter().fold(base.clone(), |cfg, channel| {
+            cfg.with_receive_window(channel, window).unwrap()
+        })
     }
 
     /// `base` with every channel capped at 4 KiB (16 KiB in total).
