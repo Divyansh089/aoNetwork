@@ -16,13 +16,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
 use crate::{
-    AdvProfile, ConnectError, DisconnectReason, LinkId, LinkRole, PeerKey, PowerMode, RadioState,
-    ScanProfile, Transport, TransportCaps, TransportEvent,
+    AdvProfile, ConnectError, DisconnectReason, LinkId, LinkRole, MAX_MTU, PeerKey, PowerMode,
+    RadioState, ScanProfile, Transport, TransportCaps, TransportEvent,
 };
 
 /// The longest manufacturer payload legacy advertising can carry; longer
 /// scan results cannot come from a real radio and are dropped.
 const MAX_SCAN_BEACON: usize = 31;
+
+/// The longest ATT value any MTU allows (`MAX_MTU` less the ATT header);
+/// a longer `on_bytes` value cannot come from a real radio.
+const MAX_ATT_VALUE: usize = MAX_MTU as usize - 3;
 
 /// Rust to Kotlin. Implemented by the Kotlin BLE shim; every call returns
 /// immediately (contract section 4).
@@ -54,7 +58,8 @@ pub trait NativeEvents: Send + Sync {
     fn on_accepted(&self, peer: PeerKey, mtu: u16) -> LinkId;
     /// The MTU of a set-up link changed.
     fn on_mtu_changed(&self, link: LinkId, mtu: u16);
-    /// One ATT value arrived on `link`.
+    /// One ATT value arrived on `link`. A value longer than 514 bytes,
+    /// which no ATT MTU allows, closes the link with `TransportLost`.
     fn on_bytes(&self, link: LinkId, bytes: Vec<u8>);
     /// The stack accepted the previous write on `link`.
     fn on_write_ready(&self, link: LinkId);
@@ -190,6 +195,8 @@ enum Cause {
     Asked,
     /// Its events overflowed the queue.
     Overflow,
+    /// Kotlin passed a value longer than any ATT MTU allows.
+    Oversize,
 }
 
 #[derive(Debug)]
@@ -247,8 +254,15 @@ impl Inner {
     fn push_link_event(&mut self, link: LinkId, event: TransportEvent) {
         if self.events.len() < self.max_events {
             self.events.push_back(event);
-        } else if let Some(slot) = self.links.get_mut(&link) {
-            slot.closing = Some(Cause::Overflow);
+        } else {
+            self.close(link, Cause::Overflow);
+        }
+    }
+
+    /// Closes `link` on Rust's own decision, at the next transport call.
+    fn close(&mut self, link: LinkId, cause: Cause) {
+        if let Some(slot) = self.links.get_mut(&link) {
+            slot.closing = Some(cause);
             self.to_disconnect.push(link);
         }
     }
@@ -542,10 +556,16 @@ impl NativeEvents for NativeHandle {
 
     fn on_bytes(&self, link: LinkId, bytes: Vec<u8>) {
         self.with(|inner| {
-            if inner.live(link).is_some() {
-                let event = TransportEvent::Received { link, chunk: bytes };
-                inner.push_link_event(link, event);
+            if inner.live(link).is_none() {
+                return;
             }
+            // Dropping the value would leave a gap in the link's bytes.
+            if bytes.len() > MAX_ATT_VALUE {
+                inner.close(link, Cause::Oversize);
+                return;
+            }
+            let event = TransportEvent::Received { link, chunk: bytes };
+            inner.push_link_event(link, event);
         });
     }
 
@@ -610,7 +630,7 @@ fn connect_error(status: NativeStatus, cause: Option<Cause>) -> ConnectError {
 fn disconnect_reason(status: NativeStatus, cause: Option<Cause>) -> DisconnectReason {
     match (cause, status) {
         (Some(Cause::Asked), _) => DisconnectReason::Closed,
-        (Some(Cause::Overflow), _) => DisconnectReason::TransportLost,
+        (Some(Cause::Overflow | Cause::Oversize), _) => DisconnectReason::TransportLost,
         (None, NativeStatus::PeerMisbehaved) => DisconnectReason::ProtocolViolation,
         (None, _) => DisconnectReason::TransportLost,
     }

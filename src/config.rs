@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crate::error::ConfigError;
-use crate::{Channel, MAX_MTU, RateLimit};
+use crate::{Channel, MAX_MTU, RateLimit, SendQueue};
 
 // Hard bounds. These catch unit errors and bound memory; they are not policy
 // (policy is the app's choice within these limits).
@@ -21,6 +21,8 @@ const MAX_RSSI: i16 = 0;
 const MIN_FRAME: usize = 64;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_QUEUE_CAP: usize = 1024 * 1024;
+// One smallest frame and the slot it is queued in.
+const MIN_CHANNEL_CAP: usize = MIN_FRAME + SendQueue::ENTRY_COST;
 // Both parts of a rate limit; the bucket arithmetic stays far from overflow.
 const MAX_RATE: u32 = 16 * 1024 * 1024;
 const MIN_FRAME_BURST: u32 = 1;
@@ -37,8 +39,10 @@ const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_MAX_MISSED_PONGS: u8 = 3;
 const DEFAULT_MAX_FRAME: usize = 16 * 1024;
 const DEFAULT_QUEUE_CAP: usize = 128 * 1024;
-// Control, Message, Telemetry, Bulk. Each holds one default-size frame and
-// together they fill `DEFAULT_QUEUE_CAP`.
+// Control, Message, Telemetry, Bulk, in default-size frames: one, three,
+// one, three; together they fill `DEFAULT_QUEUE_CAP`. Each queued frame
+// also pays `SendQueue::ENTRY_COST`, so a channel sized for n of them fits
+// n - 1 at full size.
 const DEFAULT_CHANNEL_CAPS: [usize; 4] = [16 * 1024, 48 * 1024, 16 * 1024, 48 * 1024];
 const DEFAULT_FRAME_LIMIT: RateLimit = RateLimit {
     per_second: 50,
@@ -65,7 +69,7 @@ const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 /// | `max_missed_pongs` | 3 | >= 1 |
 /// | `max_frame` | 16 KiB | 64 B..=1 MiB |
 /// | `queue_cap` | 128 KiB per link | `max_frame`..=1 MiB |
-/// | `channel_cap` | Control 16, Message 48, Telemetry 16, Bulk 48 KiB | each >= 64 B, sum <= `queue_cap` |
+/// | `channel_cap` | Control 16, Message 48, Telemetry 16, Bulk 48 KiB | each >= 128 B, sum <= `queue_cap` |
 /// | `frame_limit` | 50 frames/s, burst 200 per link | rate 1..=16 Mi, burst 1..=16 Mi |
 /// | `byte_limit` | 64 KiB/s, burst 256 KiB per link | rate 1..=16 Mi, burst 517 B..=16 MiB |
 /// | `max_strikes` | 3 | >= 1 |
@@ -171,11 +175,11 @@ impl NetworkConfig {
         }
         for channel in Channel::ALL {
             let value = self.channel_caps[channel.index()];
-            if value < MIN_FRAME {
+            if value < MIN_CHANNEL_CAP {
                 return Err(ConfigError::ChannelCapTooSmall {
                     channel,
                     value,
-                    min: MIN_FRAME,
+                    min: MIN_CHANNEL_CAP,
                 });
             }
         }
@@ -327,9 +331,10 @@ impl NetworkConfig {
 
     /// Sets the send-queue byte cap of one channel on each link.
     ///
-    /// Must be at least 64 B, and the four caps together must fit in
-    /// `queue_cap`, so a flood on one channel never takes another's room.
-    /// Bytes are counted as encoded `Data` frames.
+    /// Must be at least 128 B, one smallest frame and its slot, and the
+    /// four caps together must fit in `queue_cap`, so a flood on one
+    /// channel never takes another's room. Each payload counts as its
+    /// encoded `Data` frame plus [`SendQueue::ENTRY_COST`].
     pub fn with_channel_cap(mut self, channel: Channel, cap: usize) -> Result<Self, ConfigError> {
         self.channel_caps[channel.index()] = cap;
         self.validate()?;
@@ -887,19 +892,19 @@ mod tests {
         let base = NetworkConfig::default();
         assert_eq!(
             base.clone()
-                .with_channel_cap(Channel::Telemetry, 63)
+                .with_channel_cap(Channel::Telemetry, 127)
                 .unwrap_err(),
             ConfigError::ChannelCapTooSmall {
                 channel: Channel::Telemetry,
-                value: 63,
-                min: 64
+                value: 127,
+                min: 128
             }
         );
         assert_eq!(
-            base.with_channel_cap(Channel::Telemetry, 64)
+            base.with_channel_cap(Channel::Telemetry, 128)
                 .unwrap()
                 .channel_cap(Channel::Telemetry),
-            64
+            128
         );
     }
 

@@ -97,7 +97,8 @@ impl Iterator for Fragmenter<'_> {
 
 /// Joins chunks from one link back into encoded frames.
 ///
-/// Holds at most one partial frame, bounded by the configured `max_frame`.
+/// Holds at most one partial frame, bounded by the configured `max_frame`
+/// in length and in the memory it holds.
 /// Every error drops that partial frame and the chunk that caused it; the
 /// next frame must begin with a fresh START. Time is injected: `now` is any
 /// monotonic clock the caller owns.
@@ -227,7 +228,9 @@ impl Reassembler {
             }
             Some(in_flight) => {
                 check_seq(in_flight.next_seq, seq)?;
-                check_len(in_flight.buf.len() + payload.len(), max)?;
+                let len = in_flight.buf.len() + payload.len();
+                check_len(len, max)?;
+                grow(&mut in_flight.buf, len, max);
                 in_flight.buf.extend_from_slice(payload);
                 in_flight.next_seq = (seq + 1) & SEQ;
                 if is_end {
@@ -238,6 +241,15 @@ impl Reassembler {
                 Ok(None)
             }
         }
+    }
+}
+
+/// Makes room for `len` bytes in `buf`, doubling as `Vec` would but never
+/// past `max`, so a partial frame holds no more than `max_frame` bytes.
+fn grow(buf: &mut Vec<u8>, len: usize, max: usize) {
+    if len > buf.capacity() {
+        let target = buf.capacity().saturating_mul(2).clamp(len, max);
+        buf.reserve_exact(target - buf.len());
     }
 }
 

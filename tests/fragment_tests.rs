@@ -152,3 +152,20 @@ fn deadline_runs_from_the_first_chunk_of_a_partial_frame() {
     assert_eq!(r.push(start * 2, &[0x41, 2]), Ok(Some(vec![1, 2])));
     assert_eq!(r.deadline(), None);
 }
+
+/// A frame of exactly `max_frame` bytes comes back holding no more memory
+/// than `max_frame`: the buffer doubles as it fills, but stops at the cap.
+#[test]
+fn a_full_size_frame_holds_no_more_than_max_frame() {
+    let config = NetworkConfig::default();
+    let max = config.max_frame();
+    let frame = vec![0x5A; max];
+    let mut reassembler = Reassembler::new(&config);
+    let mut out = None;
+    for chunk in Fragmenter::new(&frame, 247).unwrap() {
+        out = reassembler.push(T0, &chunk).unwrap();
+    }
+    let out = out.expect("the last chunk completes the frame");
+    assert_eq!(out, frame);
+    assert!(out.capacity() <= max, "{} > {max}", out.capacity());
+}

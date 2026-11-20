@@ -89,7 +89,7 @@ pub enum ConfigError {
         max: usize,
     },
 
-    /// A channel's byte cap is below the smallest allowed frame.
+    /// A channel's byte cap cannot hold one smallest frame and its slot.
     #[error("{channel:?} cap must be at least {min} bytes, got {value}")]
     ChannelCapTooSmall {
         /// The channel.

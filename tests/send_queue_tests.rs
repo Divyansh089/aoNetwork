@@ -7,11 +7,16 @@ use ao_network::{Channel, NetworkConfig, SendError, SendOpts, SendQueue};
 
 /// Encoded `Data` frame size of a payload: header, channel byte, the
 /// varint length and the payload itself, exactly as `codec` lays it out.
-fn cost(len: usize) -> usize {
+fn frame(len: usize) -> usize {
     let bits = (usize::BITS - (len as u64).leading_zeros())
         .div_ceil(7)
         .max(1);
     3 + bits as usize + len
+}
+
+/// What a payload counts against its channel's cap: its frame and its slot.
+fn cost(len: usize) -> usize {
+    frame(len) + SendQueue::ENTRY_COST
 }
 
 #[test]
@@ -43,28 +48,29 @@ fn queue_full_returns_the_payload_unchanged() {
         Err(SendError::QueueFull(payload))
     );
     // The refusal changed nothing, and other channels are unaffected.
-    assert_eq!(queue.queued_bytes(Channel::Message), 900 + 5);
+    assert_eq!(queue.queued_bytes(Channel::Message), cost(900));
     queue.push(Channel::Bulk, vec![2; 900]).unwrap();
 }
 
 #[test]
 fn empty_payloads_still_use_up_the_cap() {
+    let cap = 4 * cost(0);
     let config = NetworkConfig::default()
-        .with_channel_cap(Channel::Telemetry, 64)
+        .with_channel_cap(Channel::Telemetry, cap)
         .unwrap()
-        .with_channel_cap(Channel::Message, 64)
+        .with_channel_cap(Channel::Message, cap)
         .unwrap();
     let mut queue = SendQueue::new(&config);
-    for _ in 0..64 / cost(0) {
+    for _ in 0..4 {
         queue.push(Channel::Telemetry, Vec::new()).unwrap();
         queue.push(Channel::Message, Vec::new()).unwrap();
     }
-    assert_eq!(queue.queued_bytes(Channel::Telemetry), 64);
-    assert_eq!(queue.queued_bytes(Channel::Message), 64);
+    assert_eq!(queue.queued_bytes(Channel::Telemetry), cap);
+    assert_eq!(queue.queued_bytes(Channel::Message), cap);
     // Telemetry is latest-wins (NET-21): the next push evicts the oldest
     // frame instead of refusing, and the cap still holds exactly.
     queue.push(Channel::Telemetry, Vec::new()).unwrap();
-    assert_eq!(queue.queued_bytes(Channel::Telemetry), 64);
+    assert_eq!(queue.queued_bytes(Channel::Telemetry), cap);
     // Message keeps the refusal contract: the payload comes back unchanged.
     assert_eq!(
         queue.push(Channel::Message, Vec::new()),
@@ -83,24 +89,38 @@ fn busy_channels_share_bytes_by_weight() {
             queue.push(channel, vec![0; 96]).unwrap();
         }
     }
-    // Seven rounds of 7 KiB; every channel still has frames queued after.
+    // Four whole rounds, each Message, Telemetry then Bulk; every channel
+    // still has frames queued after. A round ends where Message follows
+    // Bulk, so no round is cut part-way.
+    const ROUNDS: usize = 4;
     let mut sent = [0usize; 3];
-    let mut total = 0;
-    while total < 7 * 7 * 1024 {
+    let mut rounds = 0;
+    let mut last = None;
+    loop {
         let (channel, payload) = queue.pop(Duration::ZERO).unwrap();
+        if channel == Channel::Message && last == Some(Channel::Bulk) {
+            rounds += 1;
+            if rounds == ROUNDS {
+                break;
+            }
+        }
+        last = Some(channel);
         let i = match channel {
             Channel::Message => 0,
             Channel::Telemetry => 1,
             Channel::Bulk => 2,
             Channel::Control => unreachable!(),
         };
-        sent[i] += cost(payload.len());
-        total += cost(payload.len());
+        // The scheduler shares wire bytes; the slot charge is not sent.
+        sent[i] += frame(payload.len());
+    }
+    for channel in [Channel::Message, Channel::Telemetry, Channel::Bulk] {
+        assert!(queue.queued_bytes(channel) > 0, "{channel:?} ran dry");
     }
     // Within one frame of 4 : 2 : 1 per round.
     for (i, weight) in [4, 2, 1].into_iter().enumerate() {
-        let share = 7 * weight * 1024;
-        assert!(sent[i].abs_diff(share) <= 2 * cost(96), "{sent:?}");
+        let share = ROUNDS * weight * 1024;
+        assert!(sent[i].abs_diff(share) <= 2 * frame(96), "{sent:?}");
     }
 }
 
@@ -317,8 +337,9 @@ fn coalescing_replaces_only_frames_still_waiting() {
 /// bytes, so coalescing can never push a channel over its limit.
 #[test]
 fn a_replacement_cannot_overflow_the_cap() {
+    // One byte to spare once both frames are queued.
     let config = NetworkConfig::default()
-        .with_channel_cap(Channel::Message, 1000)
+        .with_channel_cap(Channel::Message, cost(900) + cost(90) + 1)
         .unwrap();
     let mut queue = SendQueue::new(&config);
     let key = SendOpts {
@@ -329,16 +350,16 @@ fn a_replacement_cannot_overflow_the_cap() {
         .push_opts(Channel::Message, key, vec![1; 900])
         .unwrap();
     queue.push(Channel::Message, vec![2; 90]).unwrap();
-    // Freeing the 905 bytes of the first frame still cannot make room for
-    // the 912-byte replacement: refused, and the waiting frame keeps its
-    // place and its payload.
+    // Freeing the first frame's charge leaves room for one byte more, not
+    // seven: refused, and the waiting frame keeps its place and its
+    // payload.
     let too_big: Vec<u8> = vec![3; 907];
     assert_eq!(
         queue.push_opts(Channel::Message, key, too_big),
         Err(SendError::QueueFull(vec![3; 907]))
     );
     assert_eq!(queue.queued_bytes(Channel::Message), cost(900) + cost(90));
-    // A replacement of exactly the freed bytes is admitted, in place.
+    // A replacement of exactly the room left is admitted, in place.
     queue
         .push_opts(Channel::Message, key, vec![4; 901])
         .unwrap();
@@ -409,4 +430,26 @@ fn telemetry_admits_the_newest_by_evicting_the_oldest() {
         queue.push(Channel::Telemetry, oversized.clone()),
         Err(SendError::QueueFull(oversized))
     );
+}
+
+/// A payload's spare capacity is released on admission, whether queued or
+/// coalesced in place, so its charge covers the memory the queue holds.
+#[test]
+fn spare_capacity_is_not_held() {
+    let roomy = |byte| {
+        let mut payload = Vec::with_capacity(8 * 1024);
+        payload.push(byte);
+        payload
+    };
+    let keyed = SendOpts {
+        coalesce_key: Some([1; 16]),
+        expires_at: None,
+    };
+    let mut queue = SendQueue::new(&NetworkConfig::default());
+    queue.push(Channel::Message, roomy(1)).unwrap();
+    queue.push_opts(Channel::Bulk, keyed, vec![2]).unwrap();
+    queue.push_opts(Channel::Bulk, keyed, roomy(3)).unwrap();
+    while let Some((_, payload)) = queue.pop(Duration::ZERO) {
+        assert_eq!(payload.capacity(), payload.len(), "{payload:?}");
+    }
 }
