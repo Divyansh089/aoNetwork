@@ -95,8 +95,10 @@ struct Queued {
 /// share the rest by deficit round-robin in bytes, weighted 4, 2 and 1.
 /// Each channel has its own byte cap
 /// ([`NetworkConfig::channel_cap`]); an entry costs its encoded `Data`
-/// frame size, so even empty payloads use up the cap. A push that does not
-/// fit is refused with the payload handed back.
+/// frame size plus [`ENTRY_COST`](Self::ENTRY_COST) for the slot that
+/// holds it, so the cap bounds the heap the queue uses and even empty
+/// payloads use it up. A push that does not fit is refused with the
+/// payload handed back.
 ///
 /// On top of the caps, admission honours [`SendOpts`]: a same-key push
 /// replaces a still-queued frame instead of adding bytes, a Telemetry push
@@ -140,6 +142,12 @@ pub struct SendQueue {
 }
 
 impl SendQueue {
+    /// Bytes each queued payload is charged on top of its encoded `Data`
+    /// frame: the slot that holds it in memory. Fixed rather than measured,
+    /// so admission is the same on every platform and a simulator run
+    /// replays exactly.
+    pub const ENTRY_COST: usize = 64;
+
     /// An empty queue with the caps from `config`.
     pub fn new(config: &NetworkConfig) -> Self {
         Self {
@@ -186,7 +194,7 @@ impl SendQueue {
         payload: Vec<u8>,
     ) -> Result<(), SendError> {
         let i = channel.index();
-        let cost = data_frame_len(payload.len());
+        let cost = charge(payload.len());
         if let Some(key) = opts.coalesce_key {
             if let Some(slot) = self.entries[i]
                 .iter_mut()
@@ -195,14 +203,14 @@ impl SendQueue {
                 // The replacement must fit once the old bytes are freed; if
                 // it does not, the old frame stays and the new payload
                 // comes back.
-                let freed = data_frame_len(slot.payload.len());
+                let freed = charge(slot.payload.len());
                 if cost > self.caps[i] - self.queued[i] + freed {
                     return Err(SendError::QueueFull(payload));
                 }
                 // `freed` is part of `queued`, so the subtraction cannot underflow.
                 self.queued[i] = self.queued[i] - freed + cost;
                 self.drops.coalesced = self.drops.coalesced.saturating_add(1);
-                slot.payload = payload;
+                slot.payload = tight(payload);
                 slot.expires_at = opts.expires_at;
                 return Ok(());
             }
@@ -217,7 +225,7 @@ impl SendQueue {
                 while cost > self.caps[i] - self.queued[i] {
                     match self.entries[i].pop_front() {
                         Some(oldest) => {
-                            self.queued[i] -= data_frame_len(oldest.payload.len());
+                            self.queued[i] -= charge(oldest.payload.len());
                             self.drops.evicted = self.drops.evicted.saturating_add(1);
                         }
                         None => break,
@@ -230,7 +238,7 @@ impl SendQueue {
         }
         self.queued[i] += cost;
         self.entries[i].push_back(Queued {
-            payload,
+            payload: tight(payload),
             coalesce_key: opts.coalesce_key,
             expires_at: opts.expires_at,
         });
@@ -291,7 +299,7 @@ impl SendQueue {
             let mut expired = 0u64;
             self.entries[i].retain(|entry| {
                 if entry.expires_at.is_some_and(|deadline| deadline <= now) {
-                    freed += data_frame_len(entry.payload.len());
+                    freed += charge(entry.payload.len());
                     expired += 1;
                     false
                 } else {
@@ -313,7 +321,8 @@ impl SendQueue {
             .min()
     }
 
-    /// Bytes queued on `channel`, as counted against its cap.
+    /// Bytes queued on `channel`, as counted against its cap: each
+    /// payload's encoded frame plus [`ENTRY_COST`](Self::ENTRY_COST).
     ///
     /// Expired frames count until the next [`prune`](Self::prune),
     /// [`pop`](Self::pop) or push through [`Link`](crate::Link), which run
@@ -335,7 +344,23 @@ impl SendQueue {
     fn take(&mut self, channel: Channel) -> Option<Vec<u8>> {
         let i = channel.index();
         let entry = self.entries[i].pop_front()?;
-        self.queued[i] -= data_frame_len(entry.payload.len());
+        self.queued[i] -= charge(entry.payload.len());
         Some(entry.payload)
     }
+}
+
+// The charge covers the slot on every target.
+const _: () = assert!(std::mem::size_of::<Queued>() <= SendQueue::ENTRY_COST);
+
+/// What a payload of `len` bytes counts against its channel's cap.
+fn charge(len: usize) -> usize {
+    data_frame_len(len) + SendQueue::ENTRY_COST
+}
+
+/// `payload` holding no more memory than its length, so the charge
+/// covers it: a caller's spare capacity would otherwise sit in the queue
+/// uncounted.
+fn tight(mut payload: Vec<u8>) -> Vec<u8> {
+    payload.shrink_to_fit();
+    payload
 }

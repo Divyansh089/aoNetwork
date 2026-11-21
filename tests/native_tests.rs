@@ -530,3 +530,30 @@ fn config_defaults() {
     assert_eq!(config.max_pending_events.get(), 1024);
     assert_eq!(config.max_pending_scans.get(), 64);
 }
+
+/// A value longer than any ATT MTU allows cannot come from a real radio:
+/// the link is closed rather than the value queued or dropped.
+#[test]
+fn an_oversize_value_closes_its_link() {
+    let (mut t, handle, sink, link) = up_link();
+    drain(&mut t);
+    handle.on_bytes(link, vec![1; 514]);
+    handle.on_bytes(link, vec![2; 515]);
+    handle.on_bytes(link, vec![3; 1]);
+    assert_eq!(
+        drain(&mut t),
+        [TransportEvent::Received {
+            link,
+            chunk: vec![1; 514]
+        }]
+    );
+    assert_eq!(sink.take().last(), Some(&Call::Disconnect(link)));
+    handle.on_closed(link, NativeStatus::Requested);
+    assert_eq!(
+        drain(&mut t),
+        [TransportEvent::Disconnected {
+            link,
+            reason: DisconnectReason::TransportLost
+        }]
+    );
+}

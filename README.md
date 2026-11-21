@@ -2,7 +2,7 @@
 
 **The link layer of the aoheyra mesh.** A sans-IO Rust crate that turns a raw Bluetooth LE radio (or an in-memory simulator) into reliable, prioritised, abuse-resistant links between neighbouring phones.
 
-> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection), NET-19 (discovery modes), NET-20 (simulator scenario suite), NET-21 (send-queue coalescing and expiry) and NET-22 (opportunistic links) and NET-23 (observability) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
+> **Status: pre-alpha, M0 (Foundations).** NET-01 (scaffold, naming, MSRV, CI), NET-02 (core types, errors, validated config), NET-04 (frame codec), NET-05 (fragmenter and reassembler), NET-06 (beacon codec), NET-07 (fuzz targets), NET-08 (transport trait), NET-09 (simulator), NET-10 (link state machine), NET-11 (send queue), NET-12 (network facade), NET-13 (keepalive and link metrics), NET-14 (native transport), NET-15 (peer table), NET-16 (topology policy), NET-17 (duplicate-link resolution), NET-18 (inbound abuse protection), NET-19 (discovery modes), NET-20 (simulator scenario suite), NET-21 (send-queue coalescing and expiry), NET-22 (opportunistic links), NET-23 (observability) and NET-24 (benchmarks and memory budget) are implemented; NET-03 (native contract and GATT layout) is specified in [`docs/native-contract.md`](docs/native-contract.md); everything else below describes the design in the backlog (issue IDs `NET-xx`) and is not implemented until its issue is closed. See [Roadmap](#roadmap).
 
 Cargo package name: `ao_network` (the repo name keeps its capitals; the package is snake_case).
 
@@ -119,12 +119,24 @@ and scanning are separate work.
 | Reassembly timeout | 10 s from the first chunk |
 | Keepalive | ping after 15 s with nothing received, then every 15 s until a pong; 3 missed pongs close the link (a silent peer is closed within 60 s) |
 | `max_frame` | 16 KiB |
-| Send-queue cap | 128 KiB per link, split Control 16, Message 48, Telemetry 16, Bulk 48 KiB |
+| Send-queue cap | 128 KiB per link, split Control 16, Message 48, Telemetry 16, Bulk 48 KiB; a payload counts its encoded frame plus 64 B for the slot that holds it |
 | Inbound rate limit | 50 frames/s (burst 200) and 64 KiB/s (burst 256 KiB) per link |
 | Strikes | 3 strikes blacklist a peer; blacklist and strike memory last 10 min |
 | `discovery_interval` | 10 s between scan or advertise mode changes |
 
 These may change after the BLE spike (AND-02). Source of truth is `NetworkConfig`, not this table.
+
+### Memory budget
+
+Heap requested at default config on a 64-bit target, measured by `tests/memory_budget.rs` (allocator overhead not included). Each link is loaded to the worst it admits: every send-queue channel full, from empty payloads up to the largest, behind a largest frame being written at the smallest MTU, with a largest frame half received.
+
+| | Ceiling | Measured worst |
+|---|---|---|
+| One link | 288 KiB | 258 KiB |
+| A node: 5 links, a full blacklist and a full peer table | 1.5 MiB | 1.26 MiB |
+| `NativeTransport`: 1024 pending events of 514 B and 64 scan results | 640 KiB | 568 KiB |
+
+A link holds its send queue (the 128 KiB its channel caps charge, plus the spare slots of its ring buffers), the frame being written, already cut into chunks, and at most one partial frame of up to `max_frame`. The ceilings scale with `queue_cap`, `max_frame`, `max_links`, `max_peers` and `NativeConfig`. `cargo test` fails when a change exceeds one; a ceiling is raised here and in the test together, with the reason.
 
 ## Features
 
@@ -188,6 +200,10 @@ cargo deny check
 cargo doc --no-deps --all-features
 cargo bench                             # criterion benches in benches/
 
+# Instruction counts of the same workloads, as CI compares them (Linux,
+# needs valgrind)
+python3 .github/scripts/instructions.py count counts.json
+
 # 3 simulated nodes exchanging data (after NET-12)
 cargo run --example sim_chat
 
@@ -200,9 +216,9 @@ AO_SCENARIO_SEEDS=64 cargo test --release --test scenarios
 cargo +nightly fuzz run frame_decode fuzz/corpus/frame_decode fuzz/seeds/frame_decode
 ```
 
-Tests are `cargo test` only: Miri runs in CI, and callgrind is opt-in profiling.
+Tests are `cargo test` only: Miri and the instruction counts run in CI, and callgrind profiling is opt-in.
 
-CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. A scheduled fuzzer runs every target every Sunday 00:00 IST (an equal share of 45 minutes within a 60-minute job), starting from the seeds checked in under `fuzz/seeds/`, and callgrind profiling runs on manual dispatch (`.github/workflows/`). The scenario suite (`tests/scenarios.rs`) runs with `cargo test` on fixed cases of 5, 23 and 50 nodes, under 2 minutes; every night at 02:00 IST it runs on 512 seeded topologies of 5 to 50 nodes. It checks the degree cap on every tick, one link per pair after a simultaneous start, churn, partition and heal, full-node avoidance, eviction hysteresis and an abusive peer; a failure names the seed and size it replays from.
+CI runs these commands on every PR and on `master`: fmt, clippy (`-D warnings`), tests (Linux, macOS, Windows; default and all features), `cargo doc` (`-D warnings`), cargo-deny, an MSRV build, miri and `cargo package`. On every PR a benchmark job counts the instructions each bench workload (codec, send queue, fragmentation and reassembly) executes under callgrind, for the base and the head, and fails if any grows by more than 5%; the counts are exact, so the limit cannot flake. The memory budget is checked by `cargo test`. A scheduled fuzzer runs every target every Sunday 00:00 IST (an equal share of 45 minutes within a 60-minute job), starting from the seeds checked in under `fuzz/seeds/`, and callgrind profiling runs on manual dispatch (`.github/workflows/`). The scenario suite (`tests/scenarios.rs`) runs with `cargo test` on fixed cases of 5, 23 and 50 nodes, under 2 minutes; every night at 02:00 IST it runs on 512 seeded topologies of 5 to 50 nodes. It checks the degree cap on every tick, one link per pair after a simultaneous start, churn, partition and heal, full-node avoidance, eviction hysteresis and an abusive peer; a failure names the seed and size it replays from.
 
 ### Using sibling crates locally
 

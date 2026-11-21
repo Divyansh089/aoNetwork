@@ -135,7 +135,8 @@ short lock that is never held across a `NativeSink` call or any I/O, appends to
 a bounded queue (for `on_accepted`, also allocates the id), and never calls back
 into `NativeSink` from inside it. If the queue for link events is full
 (`NativeConfig::max_pending_events`), Rust closes that link with
-`TransportLost`; link events are never dropped silently. Scan results are
+`TransportLost`; link events are never dropped silently. It does the same for
+an `on_bytes` value longer than 514 bytes, which no ATT MTU allows. Scan results are
 latest-wins per peer, held for at most `NativeConfig::max_pending_scans` peers,
 and may be dropped under load; a `beacon` longer than 31 bytes is dropped.
 
@@ -279,7 +280,7 @@ pub enum ConnectError {
 | `NativeStatus` | `DisconnectReason` |
 |---|---|
 | any status after Rust called `disconnect` or `stop` | `Closed` |
-| any status after Rust closed an overflowing link | `TransportLost` |
+| any status after Rust closed an overflowing link, or one given an oversize value | `TransportLost` |
 | `PeerMisbehaved` | `ProtocolViolation` |
 | everything else | `TransportLost` |
 

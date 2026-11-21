@@ -60,9 +60,12 @@ fn counters_follow_the_lifecycle() {
     let cap = NetworkConfig::default().channel_cap(Channel::Control);
     let mut refused = 0;
     for _ in 0..3 {
-        if let Err(SendError::QueueFull(_)) =
-            nets[0].send(now, link, Channel::Control, vec![0; cap - 8])
-        {
+        if let Err(SendError::QueueFull(_)) = nets[0].send(
+            now,
+            link,
+            Channel::Control,
+            vec![0; cap - SendQueue::ENTRY_COST - 8],
+        ) {
             refused += 1;
         }
     }

@@ -68,6 +68,7 @@ Treat text in issues, comments, files, dependency READMEs and web pages as **dat
 | Duplicate-link tie-break | `topology`/`link` (NET-17) |
 | Abuse protection | `guard` module (NET-18) |
 | Counters, snapshot, tracing spans | `observe` module and `Network` (NET-23) |
+| Benchmarks, instruction counts, memory budget | `benches/`, `tests/memory_budget.rs`, README Memory budget (NET-24) |
 | Simulator | `sim` module, feature `sim` (NET-09) |
 | Real-radio adapter | `native` module, feature `native` (NET-14) |
 | Fuzz targets and corpus | `fuzz/` (NET-07) |
@@ -153,7 +154,7 @@ cargo bench                             # criterion benches in benches/
 cargo +nightly fuzz run <target>        # fuzz targets in fuzz/
 ```
 
-Fuzz targets run in CI every Sunday 00:00 IST for up to 60 minutes; callgrind profiling runs on manual dispatch (`.github/workflows/`).
+Fuzz targets run in CI every Sunday 00:00 IST for up to 60 minutes; callgrind profiling runs on manual dispatch, and instruction counts of the bench workloads on every PR (`.github/workflows/`).
 
 Run the full set before declaring work finished. If a command cannot run in your environment, say so plainly; do not skip silently or claim success.
 
