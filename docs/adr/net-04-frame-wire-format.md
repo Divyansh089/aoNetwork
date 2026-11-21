@@ -14,7 +14,7 @@ integers are big-endian. Lengths are unsigned LEB128.
 | `Ping` | `0x03` | empty |
 | `Pong` | `0x04` | empty |
 | `Bye` | `0x05` | empty |
-| `Credit` | `0x06` | `credits` u32 (reserved for NET-25) |
+| `Credit` | `0x06` | channel u8, `credits` u32 ([NET-25](net-25-credit-flow-control.md)) |
 
 Channel bytes: `Control` 0, `Message` 1, `Telemetry` 2, `Bulk` 3.
 

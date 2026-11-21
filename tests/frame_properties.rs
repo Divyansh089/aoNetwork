@@ -54,7 +54,7 @@ fn frame() -> impl Strategy<Value = Frame> {
         Just(Frame::Ping),
         Just(Frame::Pong),
         Just(Frame::Bye),
-        any::<u32>().prop_map(|credits| Frame::Credit { credits }),
+        (channel(), any::<u32>()).prop_map(|(channel, credits)| Frame::Credit { channel, credits }),
     ]
 }
 

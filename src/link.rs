@@ -12,9 +12,9 @@ use std::time::Duration;
 use crate::codec::data_frame_len;
 use crate::guard::TokenBucket;
 use crate::{
-    Channel, ConnectError, DisconnectReason, Fragmenter, Frame, FrameError, HandshakeFailure,
-    Hello, LinkMetrics, MAX_MTU, MIN_MTU, NetworkConfig, Reassembler, SendError, SendOpts,
-    SendQueue, TransportEvent,
+    CAP_CREDIT, Channel, ConnectError, DisconnectReason, Fragmenter, Frame, FrameError,
+    HandshakeFailure, Hello, LinkMetrics, MAX_MTU, MIN_MTU, NetworkConfig, Reassembler, SendError,
+    SendOpts, SendQueue, TransportEvent,
 };
 
 /// Where a link is in its lifecycle.
@@ -82,6 +82,13 @@ pub enum LinkEnd {
 /// with [`DisconnectReason::ProtocolViolation`]. A peer that sends more
 /// frames or bytes than the configured limits allow closes it with
 /// [`DisconnectReason::AbuseDetected`].
+///
+/// When both `Hello`s set [`CAP_CREDIT`], each side grants the other its
+/// receive window per channel on reaching `Ready`, and grants the bytes
+/// of each `Data` frame back once it has handed the frame on. A frame
+/// waits until its channel has credit for all of it, so a receiver that
+/// stops processing stops the sender; a peer that sends past its grant
+/// closes the link with [`DisconnectReason::ProtocolViolation`].
 #[derive(Debug)]
 pub struct Link {
     local: Hello,
@@ -112,6 +119,30 @@ pub struct Link {
     frames_in: TokenBucket,
     /// Meters the peer's bytes, counted per received chunk.
     bytes_in: TokenBucket,
+    /// Our receive window per channel, granted to a flow-controlled peer.
+    windows: [usize; 4],
+    /// Credit accounting, once both sides have agreed to it.
+    flow: Option<Flow>,
+    /// Chunks written so far, to tell when a queued grant has gone out.
+    written: u64,
+}
+
+/// Per-channel credit accounting on a flow-controlled link, in bytes of
+/// encoded `Data` frames. What the peer may send counts only grants
+/// already written to it: it cannot have seen the rest.
+#[derive(Debug, Default)]
+struct Flow {
+    /// What the peer has granted us and we have not spent.
+    credit: [u64; 4],
+    /// What we have granted and written, and the peer has not sent.
+    allowed: [usize; 4],
+    /// What we have granted that still waits in the outbox.
+    granting: [usize; 4],
+    /// Those grants in outbox order: the write count that completes each
+    /// `Credit` frame, its channel index and its bytes.
+    unsent: VecDeque<(u64, usize, usize)>,
+    /// What the peer sent, we handed on, and we have not granted back.
+    owed: [usize; 4],
 }
 
 impl Link {
@@ -142,6 +173,9 @@ impl Link {
             // does not matter.
             frames_in: TokenBucket::new(config.frame_limit(), Duration::ZERO),
             bytes_in: TokenBucket::new(config.byte_limit(), Duration::ZERO),
+            windows: Channel::ALL.map(|channel| config.receive_window(channel)),
+            flow: None,
+            written: 0,
         }
     }
 
@@ -384,6 +418,14 @@ impl Link {
                     self.state = LinkState::Ready;
                     self.remote_max_frame =
                         Some(usize::try_from(remote.max_frame).unwrap_or(usize::MAX));
+                    if self.local.caps & remote.caps & CAP_CREDIT != 0 {
+                        // Owing the whole window is what grants it.
+                        self.flow = Some(Flow {
+                            owed: self.windows,
+                            ..Flow::default()
+                        });
+                        self.grant();
+                    }
                     out.push(LinkAction::Ready { remote, version });
                     self.fill(now);
                     self.flush(out);
@@ -394,7 +436,19 @@ impl Link {
                 ),
             },
             (LinkState::Ready, Frame::Data { channel, payload }) => {
+                if let Some(flow) = self.flow.as_mut() {
+                    let i = channel.index();
+                    let cost = data_frame_len(payload.len());
+                    if cost > flow.allowed[i] {
+                        return self.fail(DisconnectReason::ProtocolViolation, out);
+                    }
+                    // Handed on below, so it is ours to grant back.
+                    flow.allowed[i] -= cost;
+                    flow.owed[i] += cost;
+                }
                 out.push(LinkAction::Data { channel, payload });
+                self.grant();
+                self.flush(out);
             }
             (LinkState::Ready | LinkState::Handshaking, Frame::Bye) => {
                 self.fail(DisconnectReason::Bye, out);
@@ -408,8 +462,16 @@ impl Link {
                 Some(sent) => self.metrics.on_rtt(now.saturating_sub(sent)),
                 None => self.metrics.on_dropped(),
             },
-            // Credits are reserved until flow control (NET-25).
-            (LinkState::Ready, Frame::Credit { .. }) => self.metrics.on_dropped(),
+            (LinkState::Ready, Frame::Credit { channel, credits }) => match self.flow.as_mut() {
+                Some(flow) => {
+                    let i = channel.index();
+                    flow.credit[i] = flow.credit[i].saturating_add(u64::from(credits));
+                    self.fill(now);
+                    self.flush(out);
+                }
+                // Not agreed: nothing is waiting on credit.
+                None => self.metrics.on_dropped(),
+            },
             _ => self.fail(DisconnectReason::ProtocolViolation, out),
         }
     }
@@ -431,6 +493,40 @@ impl Link {
         ok
     }
 
+    /// Grants back what a channel owes once that is worth a frame of its
+    /// own: when half the window is owed, or when the peer has less than
+    /// `max_frame` granted and may be waiting. Whatever is owed is
+    /// therefore granted before the peer can stall, and the window is
+    /// never exceeded: allowed, granting and owed together never pass it.
+    fn grant(&mut self) {
+        let Some(flow) = self.flow.as_mut() else {
+            return;
+        };
+        let mut grants = Vec::new();
+        for channel in Channel::ALL {
+            let i = channel.index();
+            let owed = flow.owed[i];
+            let granted = flow.allowed[i] + flow.granting[i];
+            if owed == 0 || (granted >= self.max_frame && owed < self.windows[i] / 2) {
+                continue;
+            }
+            // Windows are at most 1 MiB, so this always fits.
+            let credits = u32::try_from(owed).unwrap_or(u32::MAX);
+            let bytes = credits as usize;
+            flow.owed[i] -= bytes;
+            flow.granting[i] += bytes;
+            grants.push((channel, credits));
+        }
+        for (channel, credits) in grants {
+            self.enqueue(&Frame::Credit { channel, credits });
+            let done = self.written + self.outbox.len() as u64;
+            if let Some(flow) = self.flow.as_mut() {
+                flow.unsent
+                    .push_back((done, channel.index(), credits as usize));
+            }
+        }
+    }
+
     fn enqueue(&mut self, frame: &Frame) {
         // Cannot fail: the MTU is checked whenever it changes.
         if let Ok(chunks) = Fragmenter::new(&frame.encode(), self.mtu) {
@@ -447,7 +543,22 @@ impl Link {
             return;
         }
         if self.outbox.is_empty() && self.state == LinkState::Ready {
-            if let Some((channel, payload)) = self.queue.pop(now) {
+            let next = match self.flow.as_mut() {
+                None => self.queue.pop(now),
+                Some(flow) => {
+                    let credit = flow.credit;
+                    let next = self.queue.pop_within(now, |channel| {
+                        usize::try_from(credit[channel.index()]).unwrap_or(usize::MAX)
+                    });
+                    if let Some((channel, payload)) = &next {
+                        // Fits: `pop_within` checked it against this credit.
+                        let cost = data_frame_len(payload.len()) as u64;
+                        flow.credit[channel.index()] -= cost;
+                    }
+                    next
+                }
+            };
+            if let Some((channel, payload)) = next {
                 self.enqueue(&Frame::Data { channel, payload });
             }
         }
@@ -461,6 +572,18 @@ impl Link {
             self.can_write = false;
             self.metrics.on_tx(chunk.len());
             out.push(LinkAction::Write(chunk));
+            self.written += 1;
+            if let Some(flow) = self.flow.as_mut() {
+                // A grant counts once its last chunk is written.
+                while let Some(&(done, i, bytes)) = flow.unsent.front() {
+                    if done > self.written {
+                        break;
+                    }
+                    flow.unsent.pop_front();
+                    flow.granting[i] -= bytes;
+                    flow.allowed[i] += bytes;
+                }
+            }
         } else if self.disconnect_when_sent {
             self.disconnect_when_sent = false;
             out.push(LinkAction::Disconnect);

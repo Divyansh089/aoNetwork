@@ -110,6 +110,21 @@ pub enum ConfigError {
         queue_cap: usize,
     },
 
+    /// A channel's receive window is outside `min..=max` bytes. The lower
+    /// bound is the current `max_frame`, so the largest frame a peer may
+    /// send always fits.
+    #[error("{channel:?} receive window must be in {min}..={max} bytes, got {value}")]
+    ReceiveWindowOutOfRange {
+        /// The channel.
+        channel: Channel,
+        /// The rejected value.
+        value: usize,
+        /// Inclusive lower bound (the current `max_frame`).
+        min: usize,
+        /// Inclusive upper bound.
+        max: usize,
+    },
+
     /// `frame_limit` has a rate outside `1..=max` or a burst outside
     /// `min_burst..=max`.
     #[error(

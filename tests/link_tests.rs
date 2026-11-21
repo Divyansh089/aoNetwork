@@ -503,7 +503,10 @@ fn rssi_is_averaged_and_ignored_frames_are_counted() {
     let mut events = vec![connected(MTU)];
     events.extend(receive(Frame::Hello(hello(1, 1, 0))));
     events.extend([rssi(-60), rssi(-68)]);
-    events.extend(receive(Frame::Credit { credits: 1 }));
+    events.extend(receive(Frame::Credit {
+        channel: Channel::Bulk,
+        credits: 1,
+    }));
     // A pong no ping asked for.
     events.extend(receive(Frame::Pong));
     for event in events {

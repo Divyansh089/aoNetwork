@@ -45,7 +45,7 @@ use crate::topology::{
     ClassCounts, Cooldowns, LinkClass, PeerTable, ReadyLink, TopologyPolicy, duplicate_loser,
 };
 use crate::{
-    AdvProfile, AppHello, Beacon, BeaconFlags, Channel, ConnectError, DisconnectReason,
+    AdvProfile, AppHello, Beacon, BeaconFlags, CAP_CREDIT, Channel, ConnectError, DisconnectReason,
     DiscoveryMode, FRAME_VERSION, HandshakeFailure, Hello, Link, LinkAction, LinkEnd, LinkId,
     LinkMetrics, LinkRole, LinkState, LocalTag, NetworkConfig, PeerKey, RadioState, ScanProfile,
     SendError, SendOpts, Transport, TransportEvent,
@@ -288,7 +288,11 @@ impl<T: Transport> Network<T> {
         self.hello = Some(Hello {
             proto_min: FRAME_VERSION,
             proto_max: FRAME_VERSION,
-            caps: 0,
+            caps: if self.config.flow_control() {
+                CAP_CREDIT
+            } else {
+                0
+            },
             // At most 1 MiB, validated by the config.
             max_frame: u32::try_from(self.config.max_frame()).unwrap_or(u32::MAX),
             tag,

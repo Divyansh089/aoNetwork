@@ -453,3 +453,36 @@ fn spare_capacity_is_not_held() {
         assert_eq!(payload.capacity(), payload.len(), "{payload:?}");
     }
 }
+
+/// NET-25: `pop_within` takes only a frame that fits its channel's
+/// allowance. A channel short of it waits, Control included, while the
+/// others go on; nothing that fits means nothing is taken.
+#[test]
+fn a_channel_without_allowance_waits_while_others_go_on() {
+    let mut queue = SendQueue::new(&NetworkConfig::default());
+    queue.push(Channel::Control, vec![1; 10]).unwrap();
+    queue.push(Channel::Bulk, vec![2; 100]).unwrap();
+    queue.push(Channel::Message, vec![3; 100]).unwrap();
+    let only =
+        |channel: Channel, bytes: usize| move |c: Channel| if c == channel { bytes } else { 0 };
+
+    assert_eq!(queue.pop_within(Duration::ZERO, |_| 0), None);
+    assert_eq!(
+        queue.pop_within(Duration::ZERO, only(Channel::Control, frame(10) - 1)),
+        None,
+        "one byte short"
+    );
+    assert_eq!(
+        queue.pop_within(Duration::ZERO, only(Channel::Bulk, frame(100))),
+        Some((Channel::Bulk, vec![2; 100])),
+        "Bulk goes while Control and Message wait"
+    );
+    assert_eq!(
+        queue.pop(Duration::ZERO),
+        Some((Channel::Control, vec![1; 10]))
+    );
+    assert_eq!(
+        queue.pop(Duration::ZERO),
+        Some((Channel::Message, vec![3; 100]))
+    );
+}
